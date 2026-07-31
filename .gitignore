@@ -10,3 +10,4 @@ local.env
 node_modules/
 vendor/
 .terraform/
+lambda/disaster_recovery/__pycache__/*
