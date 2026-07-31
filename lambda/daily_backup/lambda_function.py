@@ -1,6 +1,7 @@
 # Daily backup lambda function with Backblaze offsite backup
 import json
 import boto3
+from botocore.config import Config
 import os
 import time
 from datetime import datetime, timezone
@@ -10,14 +11,26 @@ import logging
 
 # Constants
 CONTENT_TYPE_JSON = 'application/json'
+EXPORT_PREFIX_ROOT = 'native-exports'
 
 # Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Initialize AWS clients
-dynamodb = boto3.client('dynamodb')
-s3 = boto3.client('s3')
+# Explicit timeouts so a stalled network call can't hang the Lambda invocation
+# until it times out on its own.
+BOTO_CONFIG = Config(connect_timeout=10, read_timeout=30)
+
+# Initialize AWS clients outside the handler so they're reused across
+# invocations on a warm Lambda container.
+dynamodb = boto3.client('dynamodb', config=BOTO_CONFIG)
+s3 = boto3.client('s3', config=BOTO_CONFIG)
+sts = boto3.client('sts', config=BOTO_CONFIG)
+
+# The Backblaze client depends on env vars only present when a copy is
+# requested, so it can't be built unconditionally at import time - cache it
+# lazily instead so it's only built once per warm container.
+_backblaze_client_cache = None
 
 
 def decimal_default(obj: Decimal) -> float:
@@ -30,10 +43,9 @@ def decimal_default(obj: Decimal) -> float:
 def get_account_id() -> str:
     """Get AWS account ID"""
     try:
-        sts = boto3.client('sts')
         return sts.get_caller_identity()['Account']
-    except Exception as e:
-        logger.error(f"Failed to get account ID: {str(e)}")
+    except Exception:
+        logger.exception("Failed to get account ID")
         raise
 
 
@@ -43,8 +55,8 @@ def get_region() -> str:
         # Region is automatically available in Lambda context
         session = boto3.Session()
         return session.region_name or 'us-east-1'
-    except Exception as e:
-        logger.error(f"Failed to get region: {str(e)}")
+    except Exception:
+        logger.exception("Failed to get region")
         # Fallback to us-east-1 if region detection fails
         return 'us-east-1'
 
@@ -60,16 +72,16 @@ def get_tables_to_backup() -> list[str]:
         return tables
 
     except KeyError as e:
-        logger.error("DYNAMODB_TABLES environment variable not found")
+        logger.exception("DYNAMODB_TABLES environment variable not found")
         raise ValueError("DYNAMODB_TABLES environment variable is required") from e
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse DYNAMODB_TABLES: {e}")
+        logger.exception("Failed to parse DYNAMODB_TABLES")
         raise ValueError(f"Invalid DYNAMODB_TABLES format: {e}") from e
 
 
 def generate_export_prefix(table_name: str, backup_date: str) -> str:
     """Generate S3 prefix for the export"""
-    return f"native-exports/{backup_date}/{table_name}/"
+    return f"{EXPORT_PREFIX_ROOT}/{backup_date}/{table_name}/"
 
 
 def start_table_export(table_name: str, s3_bucket: str, backup_date: str) -> dict[str, Any]:
@@ -108,7 +120,7 @@ def start_table_export(table_name: str, s3_bucket: str, backup_date: str) -> dic
         }
 
     except Exception as e:
-        logger.error(f"Failed to start export for table {table_name}: {str(e)}")
+        logger.exception(f"Failed to start export for table {table_name}")
         return {
             'table_name': table_name,
             'error': str(e),
@@ -143,7 +155,7 @@ def check_export_status(export_arn: str) -> dict[str, Any]:
         return result
 
     except Exception as e:
-        logger.error(f"Failed to check export status for {export_arn}: {str(e)}")
+        logger.exception(f"Failed to check export status for {export_arn}")
         return {
             'export_arn': export_arn,
             'status': 'UNKNOWN',
@@ -236,7 +248,7 @@ def create_export_manifest(
     }
 
     # Upload manifest to S3
-    manifest_key = f"native-exports/{backup_date}/manifest.json"
+    manifest_key = f"{EXPORT_PREFIX_ROOT}/{backup_date}/manifest.json"
 
     try:
         s3.put_object(
@@ -256,8 +268,8 @@ def create_export_manifest(
         logger.info(f"Export manifest created: s3://{s3_bucket}/{manifest_key}")
         return manifest_key
 
-    except Exception as e:
-        logger.error(f"Failed to create export manifest: {str(e)}")
+    except Exception:
+        logger.exception("Failed to create export manifest")
         return None
 
 
@@ -296,9 +308,31 @@ def list_s3_objects(bucket: str, prefix: str) -> list[dict[str, Any]]:
         logger.info(f"Found {len(objects)} objects in s3://{bucket}/{prefix}")
         return objects
 
-    except Exception as e:
-        logger.error(f"Failed to list S3 objects: {str(e)}")
+    except Exception:
+        logger.exception("Failed to list S3 objects")
         return []
+
+
+def _get_backblaze_client(backblaze_config: dict[str, str]):
+    """Get (and cache) the Backblaze S3-compatible client"""
+    global _backblaze_client_cache
+
+    if _backblaze_client_cache is None:
+        _backblaze_client_cache = boto3.client(
+            's3',
+            endpoint_url=backblaze_config['endpoint'],
+            aws_access_key_id=backblaze_config['key_id'],
+            aws_secret_access_key=backblaze_config['app_key'],
+            region_name='us-east-1',
+            config=Config(
+                signature_version='s3v4',
+                s3={'addressing_style': 'path'},
+                connect_timeout=10,
+                read_timeout=30
+            )
+        )
+
+    return _backblaze_client_cache
 
 
 def copy_to_backblaze(
@@ -312,24 +346,10 @@ def copy_to_backblaze(
 
     try:
         logger.info(f"Using Backblaze endpoint: {backblaze_config['endpoint']}")
-
-        # Initialize Backblaze S3-compatible client with specific configuration
-        backblaze_client = boto3.client(
-            's3',
-            endpoint_url=backblaze_config['endpoint'],
-            aws_access_key_id=backblaze_config['key_id'],
-            aws_secret_access_key=backblaze_config['app_key'],
-            region_name='us-east-1',
-            config=boto3.session.Config(
-                signature_version='s3v4',
-                s3={
-                    'addressing_style': 'path'
-                }
-            )
-        )
+        backblaze_client = _get_backblaze_client(backblaze_config)
 
         # Get list of all backup files for this date
-        backup_prefix = f"native-exports/{backup_date}/"
+        backup_prefix = f"{EXPORT_PREFIX_ROOT}/{backup_date}/"
         s3_objects = list_s3_objects(s3_bucket, backup_prefix)
 
         if not s3_objects:
@@ -397,7 +417,7 @@ def copy_to_backblaze(
 
             except Exception as e:
                 error_msg = f"Failed to copy {s3_key}: {str(e)}"
-                logger.error(error_msg)
+                logger.exception(f"Failed to copy {s3_key}")
                 copy_results['errors'].append(error_msg)
                 copy_results['status'] = 'PARTIAL_SUCCESS' if copy_results['files_copied'] > 0 else 'FAILED'
 
@@ -417,7 +437,7 @@ def copy_to_backblaze(
         }
 
         manifest_content = json.dumps(copy_manifest, default=decimal_default, indent=2)
-        manifest_key = f"native-exports/{backup_date}/backblaze-copy-manifest.json"
+        manifest_key = f"{EXPORT_PREFIX_ROOT}/{backup_date}/backblaze-copy-manifest.json"
 
         backblaze_client.put_object(
             Bucket=backblaze_config['bucket'],
@@ -432,7 +452,7 @@ def copy_to_backblaze(
         return copy_results
 
     except Exception as e:
-        logger.error(f"Critical error in Backblaze copy: {str(e)}")
+        logger.exception("Critical error in Backblaze copy")
         return {
             'status': 'FAILED',
             'error': str(e),
@@ -472,7 +492,7 @@ def _start_table_exports(tables_to_backup: list[str], s3_bucket: str, backup_dat
                 'status': 'FAILED'
             })
         except Exception as e:
-            logger.error(f"Failed to start export for table {table_name}: {str(e)}")
+            logger.exception(f"Failed to start export for table {table_name}")
             export_results.append({
                 'table_name': table_name,
                 'error': str(e),
@@ -516,7 +536,7 @@ def _handle_backblaze_copy(successful_exports: int, s3_bucket: str, backup_date:
             logger.info(f"Backblaze copy completed with status: {backblaze_copy_results['status']}")
             return backblaze_copy_results
         except Exception as e:
-            logger.error(f"Backblaze copy failed: {str(e)}")
+            logger.exception("Backblaze copy failed")
             return {
                 'status': 'FAILED',
                 'error': str(e),
@@ -596,7 +616,7 @@ def _log_backup_completion(successful_exports: int, failed_exports: int,
 
 def _create_error_response(error: Exception) -> dict[str, Union[int, str]]:
     """Create error response for lambda handler"""
-    logger.error(f"Critical error in backup process: {str(error)}")
+    logger.exception("Critical error in backup process")
     return {
         'statusCode': 500,
         'body': json.dumps({

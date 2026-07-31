@@ -10,4 +10,7 @@ local.env
 node_modules/
 vendor/
 .terraform/
-lambda/disaster_recovery/__pycache__/*
+
+# python bytecode caches
+__pycache__/
+*.pyc
