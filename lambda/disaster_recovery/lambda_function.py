@@ -185,11 +185,23 @@ def validate_export_info(export_info):
 
 
 def _list_data_files(s3_client, s3_bucket, prefix):
-    """List objects under a prefix (single page) and keep only data files"""
-    response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=prefix)
+    """List every object under a prefix and keep only data files"""
+    paginator = s3_client.get_paginator('list_objects_v2')
     return [
-        obj['Key'] for obj in response.get('Contents', [])
+        obj['Key']
+        for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix)
+        for obj in page.get('Contents', [])
         if obj['Key'].endswith(DATA_FILE_EXTENSIONS)
+    ]
+
+
+def _list_common_prefixes(s3_client, s3_bucket, prefix, delimiter='/'):
+    """List every CommonPrefixes entry under a prefix (paginated)"""
+    paginator = s3_client.get_paginator('list_objects_v2')
+    return [
+        common_prefix['Prefix']
+        for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix, Delimiter=delimiter)
+        for common_prefix in page.get('CommonPrefixes', [])
     ]
 
 
@@ -198,11 +210,7 @@ def _find_data_files_standard_structure(s3_client, s3_bucket, s3_prefix):
     data_prefix = f"{s3_prefix}/AWSDynamoDB/"
     logger.info(f"Trying standard structure: {data_prefix}")
 
-    response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=data_prefix, Delimiter='/')
-    export_dirs = sorted(
-        (prefix['Prefix'] for prefix in response.get('CommonPrefixes', [])),
-        reverse=True
-    )
+    export_dirs = sorted(_list_common_prefixes(s3_client, s3_bucket, data_prefix), reverse=True)
     if not export_dirs:
         return None
 
@@ -385,6 +393,23 @@ def _delete_request_for_item(item, partition_key, sort_key):
     return {'DeleteRequest': {'Key': key}}
 
 
+def _delete_batch_with_retries(table_name, delete_requests, max_retries=3):
+    """Delete one batch of up to 25 keys, retrying unprocessed requests with backoff"""
+    pending = delete_requests
+    batch_size = len(pending)
+
+    for attempt in range(max_retries):
+        response = dynamodb.batch_write_item(RequestItems={table_name: pending})
+        pending = response.get('UnprocessedItems', {}).get(table_name, [])
+        if not pending:
+            return batch_size
+        if attempt < max_retries - 1:
+            time.sleep(min(2 ** attempt, 10))
+
+    logger.warning(f"{len(pending)} items could not be deleted after {max_retries} attempts")
+    return batch_size - len(pending)
+
+
 def _delete_item_page(table_name, items, partition_key, sort_key):
     """Delete one scanned page of items in batches of 25, in parallel"""
     items_deleted = 0
@@ -395,20 +420,12 @@ def _delete_item_page(table_name, items, partition_key, sort_key):
         for i in range(0, len(items), 25):  # DynamoDB batch limit
             batch = items[i:i + 25]
             delete_requests = [_delete_request_for_item(item, partition_key, sort_key) for item in batch]
-            future = executor.submit(
-                dynamodb.batch_write_item,
-                RequestItems={table_name: delete_requests}
-            )
+            future = executor.submit(_delete_batch_with_retries, table_name, delete_requests)
             delete_futures.append(future)
 
         for future in as_completed(delete_futures):
             try:
-                result = future.result()
-                items_deleted += 25
-
-                unprocessed = result.get('UnprocessedItems', {}).get(table_name, [])
-                if unprocessed:
-                    logger.warning(f"Batch delete had {len(unprocessed)} unprocessed items")
+                items_deleted += future.result()
             except Exception:
                 logger.exception("Error in delete batch")
 
@@ -584,7 +601,9 @@ def _process_export_data_files(s3_client, s3_bucket, table_name, data_files, max
     return total_items_processed, total_items_written, total_items_failed, failed_files
 
 
-def _determine_restore_status(failed_files, total_items_failed, total_items_written):
+def _determine_restore_status(failed_files, total_items_failed, total_items_written, expected_items):
+    if expected_items > 0 and total_items_written == 0:
+        return 'FAILED'
     if failed_files:
         return 'PARTIAL_SUCCESS' if total_items_written > 0 else 'FAILED'
     if total_items_failed == 0:
@@ -607,11 +626,17 @@ def _build_restore_warning(result, failed_files, total_items_processed, total_it
         result['warning'] = f"{existing_warning}; {failed_write_warning}" if existing_warning else failed_write_warning
 
 
-def _verify_restored_count(result, table_name, expected_items):
+def _verify_restored_count(result, table_name, expected_items, cleared):
     try:
         actual_count = count_table_items(table_name)
         result['actual_table_count'] = actual_count
-        if actual_count != expected_items:
+
+        if not cleared:
+            # Without clear_existing, the restore merges into whatever was
+            # already in the table, so the table count legitimately exceeds
+            # expected_items - comparing against it would be misleading.
+            logger.info("Skipping count comparison: restore merged into existing data")
+        elif actual_count != expected_items:
             result['count_mismatch'] = (
                 f"Table has {actual_count} items but export reported {expected_items} "
                 f"(diff: {actual_count - expected_items})"
@@ -650,7 +675,7 @@ def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, 
         # managed to parse - a file that failed to parse would otherwise still
         # show 100% success.
         success_rate = (total_items_written / expected_items * 100) if expected_items > 0 else 0
-        status = _determine_restore_status(failed_files, total_items_failed, total_items_written)
+        status = _determine_restore_status(failed_files, total_items_failed, total_items_written, expected_items)
 
         result = {
             'table_name': table_name,
@@ -669,7 +694,7 @@ def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, 
         _build_restore_warning(result, failed_files, total_items_processed, total_items_failed, expected_items)
 
         if verify_count:
-            _verify_restored_count(result, table_name, expected_items)
+            _verify_restored_count(result, table_name, expected_items, clear_existing)
 
         logger.info(f" Batch write restore completed for {table_name}")
         logger.info(f"Results: {total_items_written}/{expected_items} items written, {success_rate:.2f} percent success")

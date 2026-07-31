@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional, Union, Protocol
+from urllib.parse import urlparse
 import logging
 
 # Constants
@@ -273,6 +274,19 @@ def create_export_manifest(
         return None
 
 
+def _derive_b2_region_from_endpoint(endpoint: str) -> str:
+    """
+    Derive the Backblaze region from an endpoint like
+    https://s3.us-west-004.backblazeb2.com, so SigV4 signs for the region the
+    endpoint actually serves instead of a hard-coded default.
+    """
+    hostname = urlparse(endpoint).hostname or ''
+    parts = hostname.split('.')
+    if len(parts) < 3 or parts[0] != 's3':
+        raise ValueError(f"Could not derive Backblaze region from endpoint: {endpoint}")
+    return parts[1]
+
+
 def get_backblaze_config() -> dict[str, str]:
     """Get Backblaze configuration from environment variables"""
     required_vars = {
@@ -290,13 +304,18 @@ def get_backblaze_config() -> dict[str, str]:
                 raise ValueError(f"Missing required Backblaze environment variable: {env_var}")
             config[config_key] = value
 
+        config['region'] = _derive_b2_region_from_endpoint(config['endpoint'])
         return config
     except KeyError as e:
         raise ValueError(f"Environment variable access error: {e}") from e
 
 
 def list_s3_objects(bucket: str, prefix: str) -> list[dict[str, Any]]:
-    """List all objects in S3 with given prefix"""
+    """
+    List all objects in S3 with given prefix.
+    Raises on failure rather than returning [] - callers must not treat a
+    listing error the same as a genuinely empty prefix.
+    """
     objects: list[dict[str, Any]] = []
     paginator = s3.get_paginator('list_objects_v2')
 
@@ -310,7 +329,7 @@ def list_s3_objects(bucket: str, prefix: str) -> list[dict[str, Any]]:
 
     except Exception:
         logger.exception("Failed to list S3 objects")
-        return []
+        raise
 
 
 def _get_backblaze_client(backblaze_config: dict[str, str]):
@@ -323,7 +342,7 @@ def _get_backblaze_client(backblaze_config: dict[str, str]):
             endpoint_url=backblaze_config['endpoint'],
             aws_access_key_id=backblaze_config['key_id'],
             aws_secret_access_key=backblaze_config['app_key'],
-            region_name='us-east-1',
+            region_name=backblaze_config['region'],
             config=Config(
                 signature_version='s3v4',
                 s3={'addressing_style': 'path'},
@@ -662,6 +681,8 @@ def lambda_handler(event: dict[str, Any], context: LambdaContext) -> dict[str, U
 
         # Phase 3: Create export manifest
         manifest_key = create_export_manifest(export_results, backup_date, s3_bucket, environment)
+        if manifest_key is None:
+            raise RuntimeError("Export manifest creation failed")
 
         # Generate summary
         successful_exports, failed_exports, total_items, total_size_mb = _calculate_export_summary(export_results)
