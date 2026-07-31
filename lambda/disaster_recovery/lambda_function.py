@@ -1,35 +1,60 @@
 import json
 import boto3
 import gzip
+from botocore.config import Config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
 from decimal import Decimal
 import logging
 from datetime import datetime
-import re
 
 # Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Initialize AWS clients
-dynamodb = boto3.client('dynamodb')
+# Explicit timeouts so a stalled network call can't hang the Lambda invocation
+# until it times out on its own.
+BOTO_CONFIG = Config(connect_timeout=10, read_timeout=30)
+
+JSON_GZ_EXTENSION = '.json.gz'
+JSON_EXTENSION = '.json'
+DATA_FILE_EXTENSIONS = (JSON_GZ_EXTENSION, JSON_EXTENSION)
+
+# Initialize AWS clients outside the handler so they're reused across
+# invocations on a warm Lambda container.
+dynamodb = boto3.client('dynamodb', config=BOTO_CONFIG)
+_default_s3_client = boto3.client('s3', config=BOTO_CONFIG)
+
+# The B2 client depends on env vars only present in B2 mode, so it can't be
+# built unconditionally at import time - cache it lazily instead so it's only
+# built once per warm container.
+_b2_client_cache = None
+
 
 def get_storage_client(mode='s3'):
     """Get storage client based on mode"""
-    if mode.lower() == 'b2':
+    global _b2_client_cache
+
+    if mode.lower() != 'b2':
+        return _default_s3_client
+
+    if _b2_client_cache is None:
         try:
-            return boto3.client(
+            _b2_client_cache = boto3.client(
                 's3',
                 endpoint_url='https://s3.us-west-004.backblazeb2.com',
                 aws_access_key_id=os.environ['B2_APPLICATION_KEY_ID'],
-                aws_secret_access_key=os.environ['B2_APPLICATION_KEY']
+                aws_secret_access_key=os.environ['B2_APPLICATION_KEY'],
+                config=BOTO_CONFIG
             )
         except KeyError as e:
-            logger.error(f"B2 credentials not found: {e}")
-            raise Exception(f"B2 mode requires B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY environment variables")
-    return boto3.client('s3')
+            logger.exception("B2 credentials not found")
+            raise ValueError(
+                "B2 mode requires B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY environment variables"
+            ) from e
+
+    return _b2_client_cache
 
 
 def decimal_default(obj):
@@ -49,7 +74,7 @@ def validate_environment():
             missing_vars.append(var)
 
     if missing_vars:
-        raise Exception(f"Missing required environment variables: {', '.join(missing_vars)}")
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
     s3_prefix = os.environ.get('S3_EXPORTS_PREFIX', 'native-exports')
     
@@ -74,10 +99,10 @@ def get_tables_to_restore():
         return tables
 
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse DYNAMODB_TABLES: {e}")
+        logger.exception("Failed to parse DYNAMODB_TABLES")
         raise ValueError(f"Invalid DYNAMODB_TABLES format: {e}") from e
-    except Exception as e:
-        logger.error(f"Failed to get tables to restore: {str(e)}")
+    except Exception:
+        logger.exception("Failed to get tables to restore")
         raise
 
 
@@ -105,8 +130,8 @@ def get_available_backups(s3_client, s3_bucket, s3_prefix='native-exports'):
         logger.info(f"Found {len(sorted_dates)} backup dates")
         return sorted_dates
 
-    except Exception as e:
-        logger.error(f"Failed to get available backups: {str(e)}")
+    except Exception:
+        logger.exception("Failed to get available backups")
         raise
 
 
@@ -132,8 +157,8 @@ def get_backup_manifest(s3_client, s3_bucket, backup_date, s3_prefix='native-exp
             logger.error(f"Manifest not found: {manifest_key}")
             return None
 
-    except Exception as e:
-        logger.error(f"Failed to get backup manifest: {str(e)}")
+    except Exception:
+        logger.exception("Failed to get backup manifest")
         return None
 
 
@@ -159,12 +184,92 @@ def validate_export_info(export_info):
     return True
 
 
+def _list_data_files(s3_client, s3_bucket, prefix):
+    """List objects under a prefix (single page) and keep only data files"""
+    response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=prefix)
+    return [
+        obj['Key'] for obj in response.get('Contents', [])
+        if obj['Key'].endswith(DATA_FILE_EXTENSIONS)
+    ]
+
+
+def _find_data_files_standard_structure(s3_client, s3_bucket, s3_prefix):
+    """Strategy 1: standard s3_prefix/AWSDynamoDB/{export-id}/data/*.json(.gz) layout"""
+    data_prefix = f"{s3_prefix}/AWSDynamoDB/"
+    logger.info(f"Trying standard structure: {data_prefix}")
+
+    response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=data_prefix, Delimiter='/')
+    export_dirs = sorted(
+        (prefix['Prefix'] for prefix in response.get('CommonPrefixes', [])),
+        reverse=True
+    )
+    if not export_dirs:
+        return None
+
+    # Use the most recent export directory (highest timestamp)
+    export_dir = export_dirs[0]
+    logger.info(f"Found export directory: {export_dir}")
+
+    possible_data_paths = [
+        f"{export_dir}data/",  # Standard location
+        export_dir,  # Files directly in export dir
+    ]
+
+    for data_path in possible_data_paths:
+        logger.info(f"Checking for data files in: {data_path}")
+        data_files = _list_data_files(s3_client, s3_bucket, data_path)
+        if data_files:
+            logger.info(f" Found {len(data_files)} data files in {data_path}")
+            return data_files
+
+    return None
+
+
+def _find_data_files_direct(s3_client, s3_bucket, s3_prefix):
+    """Strategy 2: data files directly under s3_prefix"""
+    logger.info(f"Trying direct files under: {s3_prefix}")
+    data_files = _list_data_files(s3_client, s3_bucket, f"{s3_prefix}/")
+    if data_files:
+        logger.info(f" Found {len(data_files)} data files directly under {s3_prefix}")
+    return data_files or None
+
+
+def _find_data_files_recursive(s3_client, s3_bucket, s3_prefix):
+    """Strategy 3: recursive search under s3_prefix"""
+    logger.info(f"Trying recursive search under: {s3_prefix}")
+
+    paginator = s3_client.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=s3_bucket, Prefix=f"{s3_prefix}/")
+
+    data_files = [
+        obj['Key']
+        for page in pages
+        for obj in page.get('Contents', [])
+        if obj['Key'].endswith(DATA_FILE_EXTENSIONS)
+    ]
+
+    if data_files:
+        logger.info(f" Found {len(data_files)} data files via recursive search")
+        return data_files
+    return None
+
+
+def _log_missing_data_files_debug(s3_client, s3_bucket, s3_prefix):
+    """Best-effort listing of what's actually under s3_prefix, to help diagnose a miss"""
+    try:
+        response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=f"{s3_prefix}/", MaxKeys=20)
+        logger.info(f"Debug: Contents under {s3_prefix}/:")
+        for obj in response.get('Contents', []):
+            logger.info(f"   {obj['Key']}")
+    except Exception:
+        logger.debug("Failed to list debug contents for %s", s3_prefix, exc_info=True)
+
+
 def get_export_data_files(s3_client, s3_bucket, export_info):
     """
     Get list of all data files for an export with robust S3 structure detection
     """
     try:
-        # Validate export info first
         validate_export_info(export_info)
 
         s3_prefix = export_info['s3_prefix'].rstrip('/')
@@ -172,158 +277,145 @@ def get_export_data_files(s3_client, s3_bucket, export_info):
 
         logger.info(f"Looking for data files for {table_name} under: {s3_prefix}")
 
-        # Strategy 1: Standard DynamoDB export structure
-        # s3_prefix/AWSDynamoDB/{export-id}/data/*.json.gz
-        data_prefix = f"{s3_prefix}/AWSDynamoDB/"
+        search_strategies = (
+            ("standard structure", _find_data_files_standard_structure),
+            ("direct file search", _find_data_files_direct),
+            ("recursive search", _find_data_files_recursive),
+        )
 
-        try:
-            logger.info(f"Trying standard structure: {data_prefix}")
+        for strategy_name, strategy in search_strategies:
+            try:
+                data_files = strategy(s3_client, s3_bucket, s3_prefix)
+                if data_files:
+                    return data_files
+            except Exception as e:
+                logger.warning(f"{strategy_name} failed: {str(e)}")
 
-            response = s3_client.list_objects_v2(
-                Bucket=s3_bucket,
-                Prefix=data_prefix,
-                Delimiter='/'
-            )
-
-            export_dirs = [prefix['Prefix'] for prefix in response.get('CommonPrefixes', [])]
-
-            if export_dirs:
-                # Use the most recent export directory (highest timestamp)
-                export_dirs.sort(reverse=True)
-                export_dir = export_dirs[0]
-
-                logger.info(f"Found export directory: {export_dir}")
-
-                # Look for data files in multiple possible locations
-                possible_data_paths = [
-                    f"{export_dir}data/",  # Standard location
-                    export_dir,  # Files directly in export dir
-                ]
-
-                for data_path in possible_data_paths:
-                    logger.info(f"Checking for data files in: {data_path}")
-
-                    response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=data_path)
-
-                    data_files = []
-                    for obj in response.get('Contents', []):
-                        if obj['Key'].endswith('.json.gz') or obj['Key'].endswith('.json'):
-                            data_files.append(obj['Key'])
-
-                    if data_files:
-                        logger.info(f" Found {len(data_files)} data files in {data_path}")
-                        return data_files
-
-        except Exception as e:
-            logger.warning(f"Standard structure failed: {str(e)}")
-
-        # Strategy 2: Files directly under s3_prefix
-        logger.info(f"Trying direct files under: {s3_prefix}")
-
-        try:
-            response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=f"{s3_prefix}/")
-
-            data_files = []
-            for obj in response.get('Contents', []):
-                if obj['Key'].endswith('.json.gz') or obj['Key'].endswith('.json'):
-                    data_files.append(obj['Key'])
-
-            if data_files:
-                logger.info(f" Found {len(data_files)} data files directly under {s3_prefix}")
-                return data_files
-
-        except Exception as e:
-            logger.warning(f"Direct file search failed: {str(e)}")
-
-        # Strategy 3: Recursive search under s3_prefix
-        logger.info(f"Trying recursive search under: {s3_prefix}")
-
-        try:
-            paginator = s3_client.get_paginator('list_objects_v2')
-            pages = paginator.paginate(Bucket=s3_bucket, Prefix=f"{s3_prefix}/")
-
-            data_files = []
-            for page in pages:
-                for obj in page.get('Contents', []):
-                    if obj['Key'].endswith('.json.gz') or obj['Key'].endswith('.json'):
-                        data_files.append(obj['Key'])
-
-            if data_files:
-                logger.info(f" Found {len(data_files)} data files via recursive search")
-                return data_files
-
-        except Exception as e:
-            logger.warning(f"Recursive search failed: {str(e)}")
-
-        # If we get here, no files were found
         logger.error(f" No data files found for {table_name} under any search strategy")
+        _log_missing_data_files_debug(s3_client, s3_bucket, s3_prefix)
 
-        # List what's actually there for debugging
-        try:
-            response = s3_client.list_objects_v2(
-                Bucket=s3_bucket,
-                Prefix=f"{s3_prefix}/",
-                MaxKeys=20
-            )
+        raise RuntimeError(f"No data files found for export {table_name}")
 
-            logger.info(f"Debug: Contents under {s3_prefix}/:")
-            for obj in response.get('Contents', []):
-                logger.info(f"   {obj['Key']}")
-
-        except Exception:
-            pass
-
-        raise Exception(f"No data files found for export {table_name}")
-
-    except Exception as e:
-        logger.error(f"Failed to get export data files for {export_info.get('table_name', 'unknown')}: {str(e)}")
+    except Exception:
+        logger.exception(
+            f"Failed to get export data files for {export_info.get('table_name', 'unknown')}"
+        )
         raise
 
 
+def _read_export_file_content(s3_key, response):
+    """Read an export file's body, transparently decompressing .gz files"""
+    if s3_key.endswith('.gz'):
+        return gzip.decompress(response['Body'].read()).decode('utf-8')
+    return response['Body'].read().decode('utf-8')
+
+
+def _parse_dynamodb_export_lines(content, s3_key):
+    """Parse each newline-delimited JSON line of an export file into an item"""
+    items = []
+    line_count = 0
+    error_count = 0
+
+    for line in content.strip().split('\n'):
+        line_count += 1
+        if not line.strip():
+            continue
+        try:
+            item_data = json.loads(line)
+            if 'Item' in item_data:
+                items.append(item_data['Item'])
+            elif isinstance(item_data, dict):
+                # Handle case where the line is already the item
+                items.append(item_data)
+        except json.JSONDecodeError as e:
+            error_count += 1
+            if error_count <= 5:  # Log first 5 errors only
+                logger.warning(f"JSON decode error on line {line_count}: {str(e)}")
+
+    if error_count > 0:
+        logger.warning(f"File {s3_key}: {error_count} JSON decode errors out of {line_count} lines")
+
+    return items
+
+
 def parse_dynamodb_json_file(s3_client, s3_bucket, s3_key):
-    """Parse a single DynamoDB JSON export file from S3"""
+    """
+    Parse a single DynamoDB JSON export file from S3.
+    Returns (items, file_failed). file_failed=True means the file could not be
+    downloaded/decompressed/read at all, as distinct from an empty file.
+    """
     try:
         logger.debug(f"Parsing file: {s3_key}")
 
         response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
-
-        # Handle gzipped files
-        if s3_key.endswith('.gz'):
-            content = gzip.decompress(response['Body'].read()).decode('utf-8')
-        else:
-            content = response['Body'].read().decode('utf-8')
-
-        items = []
-        line_count = 0
-        error_count = 0
-
-        for line in content.strip().split('\n'):
-            line_count += 1
-            if line.strip():
-                try:
-                    item_data = json.loads(line)
-                    if 'Item' in item_data:
-                        items.append(item_data['Item'])
-                    elif isinstance(item_data, dict):
-                        # Handle case where the line is already the item
-                        items.append(item_data)
-                except json.JSONDecodeError as e:
-                    error_count += 1
-                    if error_count <= 5:  # Log first 5 errors only
-                        logger.warning(f"JSON decode error on line {line_count}: {str(e)}")
-
-        if error_count > 0:
-            logger.warning(f"File {s3_key}: {error_count} JSON decode errors out of {line_count} lines")
+        content = _read_export_file_content(s3_key, response)
+        items = _parse_dynamodb_export_lines(content, s3_key)
 
         logger.debug(f"Parsed {len(items)} items from {s3_key}")
-        return items
+        return items, False
 
-    except Exception as e:
-        logger.error(f"Error parsing file {s3_key}: {str(e)}")
-        return []
+    except Exception:
+        logger.exception(f"Error parsing file {s3_key}")
+        return [], True
 
 
-def clear_existing_table_data(table_name, preserve_schema=True):
+def _get_table_key_schema(table_name):
+    """Return (partition_key, sort_key) attribute names for a table"""
+    response = dynamodb.describe_table(TableName=table_name)
+    key_schema = response['Table']['KeySchema']
+
+    partition_key = None
+    sort_key = None
+    for key in key_schema:
+        if key['KeyType'] == 'HASH':
+            partition_key = key['AttributeName']
+        elif key['KeyType'] == 'RANGE':
+            sort_key = key['AttributeName']
+
+    if not partition_key:
+        raise RuntimeError("Could not determine partition key")
+
+    return partition_key, sort_key
+
+
+def _delete_request_for_item(item, partition_key, sort_key):
+    key = {partition_key: item[partition_key]}
+    if sort_key and sort_key in item:
+        key[sort_key] = item[sort_key]
+    return {'DeleteRequest': {'Key': key}}
+
+
+def _delete_item_page(table_name, items, partition_key, sort_key):
+    """Delete one scanned page of items in batches of 25, in parallel"""
+    items_deleted = 0
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        delete_futures = []
+
+        for i in range(0, len(items), 25):  # DynamoDB batch limit
+            batch = items[i:i + 25]
+            delete_requests = [_delete_request_for_item(item, partition_key, sort_key) for item in batch]
+            future = executor.submit(
+                dynamodb.batch_write_item,
+                RequestItems={table_name: delete_requests}
+            )
+            delete_futures.append(future)
+
+        for future in as_completed(delete_futures):
+            try:
+                result = future.result()
+                items_deleted += 25
+
+                unprocessed = result.get('UnprocessedItems', {}).get(table_name, [])
+                if unprocessed:
+                    logger.warning(f"Batch delete had {len(unprocessed)} unprocessed items")
+            except Exception:
+                logger.exception("Error in delete batch")
+
+    return items_deleted
+
+
+def clear_existing_table_data(table_name):
     """
     Clear existing table data before restore
     WARNING: This deletes all existing data!
@@ -331,91 +423,75 @@ def clear_existing_table_data(table_name, preserve_schema=True):
     try:
         logger.warning(f" CLEARING ALL DATA from table: {table_name}")
 
-        # Get table schema
-        response = dynamodb.describe_table(TableName=table_name)
-        table_info = response['Table']
-        key_schema = table_info['KeySchema']
-
-        # Get partition key and sort key names
-        partition_key = None
-        sort_key = None
-
-        for key in key_schema:
-            if key['KeyType'] == 'HASH':
-                partition_key = key['AttributeName']
-            elif key['KeyType'] == 'RANGE':
-                sort_key = key['AttributeName']
-
-        if not partition_key:
-            raise Exception("Could not determine partition key")
-
+        partition_key, sort_key = _get_table_key_schema(table_name)
         logger.info(f"Table schema - Partition key: {partition_key}, Sort key: {sort_key}")
 
-        # Scan and delete all items
-        scan_kwargs = {'TableName': table_name}
         items_deleted = 0
         batch_count = 0
 
-        while True:
-            response = dynamodb.scan(**scan_kwargs)
-            items = response.get('Items', [])
-
+        paginator = dynamodb.get_paginator('scan')
+        for page in paginator.paginate(TableName=table_name):
+            items = page.get('Items', [])
             if not items:
-                break
+                continue
 
-            # Delete items in batches
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                delete_futures = []
-
-                for i in range(0, len(items), 25):  # DynamoDB batch limit
-                    batch = items[i:i + 25]
-                    delete_requests = []
-
-                    for item in batch:
-                        key = {partition_key: item[partition_key]}
-                        if sort_key and sort_key in item:
-                            key[sort_key] = item[sort_key]
-
-                        delete_requests.append({
-                            'DeleteRequest': {'Key': key}
-                        })
-
-                    future = executor.submit(
-                        dynamodb.batch_write_item,
-                        RequestItems={table_name: delete_requests}
-                    )
-                    delete_futures.append(future)
-                    batch_count += 1
-
-                # Wait for all delete batches to complete
-                for future in as_completed(delete_futures):
-                    try:
-                        result = future.result()
-                        items_deleted += 25
-
-                        # Handle unprocessed items
-                        unprocessed = result.get('UnprocessedItems', {}).get(table_name, [])
-                        if unprocessed:
-                            logger.warning(f"Batch delete had {len(unprocessed)} unprocessed items")
-
-                    except Exception as e:
-                        logger.error(f"Error in delete batch: {str(e)}")
-
-            # Handle pagination
-            if 'LastEvaluatedKey' in response:
-                scan_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
-            else:
-                break
-
+            items_deleted += _delete_item_page(table_name, items, partition_key, sort_key)
+            batch_count += 1
             if batch_count % 10 == 0:
                 logger.info(f"Deletion progress: ~{items_deleted} items deleted...")
 
         logger.info(f" Successfully cleared {items_deleted} items from {table_name}")
         return True, items_deleted
 
-    except Exception as e:
-        logger.error(f" Failed to clear table data: {str(e)}")
+    except Exception:
+        logger.exception(" Failed to clear table data")
         return False, 0
+
+
+def _attempt_batch_write(table_name, put_requests, batch_size, attempt, max_retries):
+    """
+    Try one batch_write_item call. Returns (successful, failed, retry_requests).
+    retry_requests is non-None only when the caller should retry with those requests.
+    """
+    response = dynamodb.batch_write_item(RequestItems={table_name: put_requests})
+    unprocessed = response.get('UnprocessedItems', {}).get(table_name, [])
+
+    if not unprocessed:
+        return batch_size, 0, None
+
+    if attempt < max_retries - 1:
+        logger.debug(f"Batch had {len(unprocessed)} unprocessed items, retrying... (attempt {attempt + 1})")
+        return batch_size - len(unprocessed), 0, unprocessed
+
+    logger.warning(f"Final attempt: {len(unprocessed)} items failed after {max_retries} retries")
+    return batch_size - len(unprocessed), len(unprocessed), None
+
+
+def _write_batch_with_retries(table_name, batch_items, max_retries=3):
+    """Write a single batch of items, retrying unprocessed items with backoff"""
+    batch_size = len(batch_items)
+    put_requests = [{'PutRequest': {'Item': item}} for item in batch_items]
+
+    try:
+        for attempt in range(max_retries):
+            try:
+                successful, failed, retry_requests = _attempt_batch_write(
+                    table_name, put_requests, batch_size, attempt, max_retries
+                )
+                if retry_requests is None:
+                    return successful, failed
+                time.sleep(min(2 ** attempt, 10))  # Exponential backoff
+                put_requests = retry_requests
+            except Exception:
+                if attempt >= max_retries - 1:
+                    raise
+                logger.warning(f"Batch write attempt {attempt + 1} failed, retrying...", exc_info=True)
+                time.sleep(min(2 ** attempt, 10))
+    except Exception:
+        logger.exception("Batch write failed after all retries")
+        return 0, batch_size
+
+    return 0, batch_size
 
 
 def batch_write_items_to_table(table_name, items, max_workers=5):
@@ -429,69 +505,13 @@ def batch_write_items_to_table(table_name, items, max_workers=5):
 
     logger.info(f"Writing {total_items} items to {table_name} using {max_workers} threads")
 
-    def write_batch(batch_items):
-        """Write a single batch of items"""
-        batch_successful = 0
-        batch_failed = 0
-        max_retries = 3
-
-        try:
-            put_requests = []
-            for item in batch_items:
-                put_requests.append({
-                    'PutRequest': {'Item': item}
-                })
-
-            for attempt in range(max_retries):
-                try:
-                    response = dynamodb.batch_write_item(
-                        RequestItems={table_name: put_requests}
-                    )
-
-                    batch_successful = len(batch_items)
-
-                    # Handle unprocessed items
-                    unprocessed = response.get('UnprocessedItems', {}).get(table_name, [])
-                    if unprocessed and attempt < max_retries - 1:
-                        logger.debug(
-                            f"Batch had {len(unprocessed)} unprocessed items, retrying... (attempt {attempt + 1})")
-                        time.sleep(min(2 ** attempt, 10))  # Exponential backoff
-                        put_requests = unprocessed
-                        batch_successful = len(batch_items) - len(unprocessed)
-                        continue
-                    elif unprocessed:
-                        # Final attempt still has unprocessed items
-                        batch_failed = len(unprocessed)
-                        batch_successful = len(batch_items) - batch_failed
-                        logger.warning(f"Final attempt: {batch_failed} items failed after {max_retries} retries")
-
-                    break  # Success
-
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Batch write attempt {attempt + 1} failed: {str(e)}, retrying...")
-                        time.sleep(min(2 ** attempt, 10))
-                        continue
-                    else:
-                        raise  # Final attempt failed
-
-        except Exception as e:
-            logger.error(f"Batch write failed after all retries: {str(e)}")
-            batch_failed = len(batch_items)
-            batch_successful = 0
-
-        return batch_successful, batch_failed
-
     # Process items in batches of 25 (DynamoDB limit) using threads
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
+        futures = [
+            executor.submit(_write_batch_with_retries, table_name, items[i:i + 25])
+            for i in range(0, total_items, 25)
+        ]
 
-        for i in range(0, total_items, 25):
-            batch = items[i:i + 25]
-            future = executor.submit(write_batch, batch)
-            futures.append(future)
-
-        # Collect results
         batch_count = 0
         for future in as_completed(futures):
             try:
@@ -503,8 +523,8 @@ def batch_write_items_to_table(table_name, items, max_workers=5):
                 if batch_count % 20 == 0:  # Progress every 500 items (20 batches)
                     logger.info(f"Progress: {items_written + failed_items}/{total_items} items processed")
 
-            except Exception as e:
-                logger.error(f"Thread execution failed: {str(e)}")
+            except Exception:
+                logger.exception("Thread execution failed")
                 failed_items += 25  # Assume whole batch failed
 
     success_rate = (items_written / total_items * 100) if total_items > 0 else 0
@@ -516,63 +536,121 @@ def batch_write_items_to_table(table_name, items, max_workers=5):
     return items_written, failed_items
 
 
-def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, clear_existing=False, max_workers=5):
+def count_table_items(table_name):
+    """
+    Get an exact item count for a table via a Select=COUNT scan.
+    Expensive on large tables (reads every item) - only call when explicitly requested.
+    """
+    total = 0
+    paginator = dynamodb.get_paginator('scan')
+
+    for page in paginator.paginate(TableName=table_name, Select='COUNT'):
+        total += page.get('Count', 0)
+
+    return total
+
+
+def _process_export_data_files(s3_client, s3_bucket, table_name, data_files, max_workers):
+    """Parse and write each export data file, returning aggregate counts"""
+    total_items_processed = 0
+    total_items_written = 0
+    total_items_failed = 0
+    failed_files = []
+
+    for i, data_file in enumerate(data_files):
+        logger.info(f" Processing file {i + 1}/{len(data_files)}: {data_file}")
+
+        items, file_failed = parse_dynamodb_json_file(s3_client, s3_bucket, data_file)
+        if file_failed:
+            logger.error(f"File failed to parse and was skipped entirely: {data_file}")
+            failed_files.append(data_file)
+            continue
+        if not items:
+            logger.warning(f"No items found in {data_file}")
+            continue
+
+        logger.info(f"Found {len(items)} items in {data_file}")
+
+        written, failed = batch_write_items_to_table(table_name, items, max_workers)
+
+        total_items_processed += len(items)
+        total_items_written += written
+        total_items_failed += failed
+
+        # Brief pause between files to avoid overwhelming DynamoDB
+        if i < len(data_files) - 1:
+            time.sleep(1)
+
+    return total_items_processed, total_items_written, total_items_failed, failed_files
+
+
+def _determine_restore_status(failed_files, total_items_failed, total_items_written):
+    if failed_files:
+        return 'PARTIAL_SUCCESS' if total_items_written > 0 else 'FAILED'
+    if total_items_failed == 0:
+        return 'COMPLETED'
+    if total_items_written > 0:
+        return 'PARTIAL_SUCCESS'
+    return 'FAILED'
+
+
+def _build_restore_warning(result, failed_files, total_items_processed, total_items_failed, expected_items):
+    if failed_files:
+        result['failed_files'] = failed_files
+        result['warning'] = f"{len(failed_files)} file(s) failed to parse and were skipped entirely"
+    elif total_items_processed != expected_items:
+        result['count_mismatch'] = f"Parsed {total_items_processed} items but export reported {expected_items}"
+
+    if total_items_failed > 0:
+        existing_warning = result.get('warning')
+        failed_write_warning = f"{total_items_failed} items failed to write"
+        result['warning'] = f"{existing_warning}; {failed_write_warning}" if existing_warning else failed_write_warning
+
+
+def _verify_restored_count(result, table_name, expected_items):
+    try:
+        actual_count = count_table_items(table_name)
+        result['actual_table_count'] = actual_count
+        if actual_count != expected_items:
+            result['count_mismatch'] = (
+                f"Table has {actual_count} items but export reported {expected_items} "
+                f"(diff: {actual_count - expected_items})"
+            )
+    except Exception as e:
+        logger.exception(f"Post-restore count verification failed for {table_name}")
+        result['count_verification_error'] = str(e)
+
+
+def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, clear_existing=False,
+                                  max_workers=5, verify_count=False):
     """
     Restore table data from S3 export using batch write operations
     """
     logger.info(f" Starting batch write restore for table: {table_name}")
 
     try:
-        # Optional: Clear existing data first
         items_cleared = 0
         if clear_existing:
-            logger.warning(f" Clearing existing data as requested")
+            logger.warning(" Clearing existing data as requested")
             success, items_cleared = clear_existing_table_data(table_name)
             if not success:
-                raise Exception("Failed to clear existing table data")
+                raise RuntimeError("Failed to clear existing table data")
 
-        # Get all data files for this export
         data_files = get_export_data_files(s3_client, s3_bucket, export_info)
         if not data_files:
-            raise Exception("No data files found for export")
+            raise RuntimeError("No data files found for export")
 
-        total_items_processed = 0
-        total_items_written = 0
-        total_items_failed = 0
+        total_items_processed, total_items_written, total_items_failed, failed_files = (
+            _process_export_data_files(s3_client, s3_bucket, table_name, data_files, max_workers)
+        )
 
-        # Process each data file
-        for i, data_file in enumerate(data_files):
-            logger.info(f" Processing file {i + 1}/{len(data_files)}: {data_file}")
+        expected_items = export_info.get('item_count', 0)
 
-            # Parse items from this file
-            items = parse_dynamodb_json_file(s3_client, s3_bucket, data_file)
-            if not items:
-                logger.warning(f"No items found in {data_file}")
-                continue
-
-            logger.info(f"Found {len(items)} items in {data_file}")
-
-            # Write items to table
-            written, failed = batch_write_items_to_table(table_name, items, max_workers)
-
-            total_items_processed += len(items)
-            total_items_written += written
-            total_items_failed += failed
-
-            # Brief pause between files to avoid overwhelming DynamoDB
-            if i < len(data_files) - 1:
-                time.sleep(1)
-
-        # Calculate success rate
-        success_rate = (total_items_written / total_items_processed * 100) if total_items_processed > 0 else 0
-
-        # Determine status
-        if total_items_failed == 0:
-            status = 'COMPLETED'
-        elif total_items_written > 0:
-            status = 'PARTIAL_SUCCESS'
-        else:
-            status = 'FAILED'
+        # Success rate against the expected export count, not just the items we
+        # managed to parse - a file that failed to parse would otherwise still
+        # show 100% success.
+        success_rate = (total_items_written / expected_items * 100) if expected_items > 0 else 0
+        status = _determine_restore_status(failed_files, total_items_failed, total_items_written)
 
         result = {
             'table_name': table_name,
@@ -584,21 +662,22 @@ def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, 
             'items_written': total_items_written,
             'items_failed': total_items_failed,
             'success_rate': f"{success_rate:.2f}%",
-            'expected_items': export_info.get('item_count', 0),
+            'expected_items': expected_items,
             'export_arn': export_info.get('export_arn', 'unknown')
         }
 
-        if total_items_failed > 0:
-            result['warning'] = f"{total_items_failed} items failed to write"
+        _build_restore_warning(result, failed_files, total_items_processed, total_items_failed, expected_items)
+
+        if verify_count:
+            _verify_restored_count(result, table_name, expected_items)
 
         logger.info(f" Batch write restore completed for {table_name}")
-        logger.info(
-            f"Results: {total_items_written}/{total_items_processed} items written ({success_rate:.2f}% success)")
+        logger.info(f"Results: {total_items_written}/{expected_items} items written, {success_rate:.2f} percent success")
 
         return result
 
     except Exception as e:
-        logger.error(f" Batch write restore failed for {table_name}: {str(e)}")
+        logger.exception(f" Batch write restore failed for {table_name}")
         return {
             'table_name': table_name,
             'restore_type': 'BATCH_WRITE_FROM_S3',
@@ -607,283 +686,331 @@ def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, 
         }
 
 
+def _parse_restore_request(event):
+    return {
+        'restore_mode': event.get('mode', 's3').lower(),
+        'backup_date': event.get('backup_date', 'latest'),
+        'specific_tables': event.get('tables', []),
+        'dry_run': event.get('dry_run', False),
+        'clear_existing_data': event.get('clear_existing_data', False),
+        'max_workers': event.get('max_workers', 5),
+        'verify_count': event.get('verify_count', False),
+    }
+
+
+def _resolve_s3_bucket(restore_mode, env_config):
+    if restore_mode != 'b2':
+        return env_config['backup_bucket']
+
+    s3_bucket = os.environ.get('B2_BUCKET_NAME')
+    if not s3_bucket:
+        raise ValueError("B2 mode requires B2_BUCKET_NAME environment variable")
+    return s3_bucket
+
+
+def _log_restore_configuration(config, environment, s3_bucket, s3_prefix):
+    logger.info("  Configuration:")
+    logger.info(f"  Environment: {environment}")
+    logger.info(f"  Storage Mode: {config['restore_mode'].upper()}")
+    logger.info(f"  Bucket: {s3_bucket}")
+    logger.info(f"  Prefix: {s3_prefix}")
+    logger.info(f"  Backup Date: {config['backup_date']}")
+    logger.info(f"  Specific Tables: {config['specific_tables'] or 'All available'}")
+    logger.info(f"  Dry Run: {config['dry_run']}")
+    logger.info(f"  Clear Existing Data: {config['clear_existing_data']}")
+    logger.info(f"  Max Workers: {config['max_workers']}")
+    logger.info(f"  Verify Count: {config['verify_count']}")
+
+    if config['clear_existing_data']:
+        logger.warning(" WARNING: clear_existing_data=True will DELETE ALL existing data before restore!")
+
+
+def _resolve_tables_to_restore(specific_tables, all_available_tables):
+    if not specific_tables:
+        return all_available_tables
+
+    invalid_tables = [t for t in specific_tables if t not in all_available_tables]
+    if invalid_tables:
+        logger.warning(f"Invalid tables requested: {invalid_tables}")
+
+    tables_to_restore = [table for table in specific_tables if table in all_available_tables]
+    if not tables_to_restore:
+        raise ValueError(f"None of the specified tables are available. Available: {all_available_tables}")
+    return tables_to_restore
+
+
+def _resolve_backup_date(s3_client, s3_bucket, s3_prefix, backup_date):
+    if backup_date != 'latest':
+        return backup_date
+
+    available_backups = get_available_backups(s3_client, s3_bucket, s3_prefix)
+    if not available_backups:
+        raise RuntimeError(f"No backups found in {s3_bucket}/{s3_prefix}/")
+
+    resolved_date = available_backups[0]
+    logger.info(f" Using latest backup from: {resolved_date}")
+    return resolved_date
+
+
+def _build_available_exports(manifest, tables_to_restore, backup_date):
+    available_exports = {}
+    invalid_exports = []
+
+    for export in manifest.get('exports', []):
+        try:
+            validate_export_info(export)
+            table_name = export['table_name']
+            if table_name in tables_to_restore:
+                available_exports[table_name] = export
+        except ValueError as e:
+            invalid_exports.append(f"{export.get('table_name', 'unknown')}: {str(e)}")
+
+    if invalid_exports:
+        logger.warning(f" Invalid exports found: {invalid_exports}")
+
+    logger.info(f"Available exports for {backup_date}: {list(available_exports.keys())}")
+
+    missing_exports = [t for t in tables_to_restore if t not in available_exports]
+    if missing_exports:
+        logger.warning(f" No valid exports found for tables: {missing_exports}")
+
+    if not available_exports:
+        raise RuntimeError("No valid exports found for any requested tables")
+
+    return available_exports
+
+
+def _estimate_export_size_mb(s3_client, s3_bucket, data_files):
+    total_file_size = 0
+    for file_key in data_files[:5]:  # Sample first 5 files
+        try:
+            response = s3_client.head_object(Bucket=s3_bucket, Key=file_key)
+            total_file_size += response['ContentLength']
+        except Exception:
+            logger.debug("Failed to head_object %s for size estimate", file_key, exc_info=True)
+    return round(total_file_size / 1024 / 1024, 2)
+
+
+def _validate_table_for_dry_run(s3_client, s3_bucket, table_name, export_info, config):
+    try:
+        data_files = get_export_data_files(s3_client, s3_bucket, export_info)
+        return {
+            'table_name': table_name,
+            'status': 'READY',
+            'export_arn': export_info.get('export_arn', 'unknown'),
+            'expected_items': export_info.get('item_count', 0),
+            'data_files_count': len(data_files),
+            'estimated_size_mb': _estimate_export_size_mb(s3_client, s3_bucket, data_files),
+            's3_prefix_used': export_info.get('s3_prefix', 'unknown'),
+            'restore_options': {
+                'clear_existing_data': config['clear_existing_data'],
+                'max_workers': config['max_workers']
+            }
+        }
+    except Exception as e:
+        return {'table_name': table_name, 'status': 'ERROR', 'error': str(e)}
+
+
+def _run_dry_run(s3_client, s3_bucket, s3_prefix, environment, backup_date, tables_to_restore,
+                  available_exports, config):
+    logger.info(" DRY RUN MODE - Validating restore capability without writing data")
+
+    validation_results = []
+    for table_name in tables_to_restore:
+        if table_name not in available_exports:
+            validation_results.append({
+                'table_name': table_name,
+                'status': 'NO_EXPORT',
+                'error': 'No valid export found for this table'
+            })
+            continue
+
+        validation_results.append(
+            _validate_table_for_dry_run(s3_client, s3_bucket, table_name, available_exports[table_name], config)
+        )
+
+    dry_run_summary = {
+        'dry_run': True,
+        'backup_date': backup_date,
+        'environment': environment,
+        's3_bucket': s3_bucket,
+        's3_prefix': s3_prefix,
+        'restore_type': 'BATCH_WRITE_FROM_S3_TO_EXISTING_TABLES',
+        'tables_requested': len(tables_to_restore),
+        'validation_results': validation_results,
+        'configuration': {
+            'clear_existing_data': config['clear_existing_data'],
+            'max_workers': config['max_workers']
+        },
+        'warnings': [
+            'This approach writes directly to existing tables with the same names',
+            'Set clear_existing_data=true to clear existing data first',
+            'Restore will merge with existing data if clear_existing_data=false'
+        ]
+    }
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps(dry_run_summary, default=decimal_default, indent=2)
+    }
+
+
+def _run_table_restores(s3_client, s3_bucket, tables_to_restore, available_exports, config):
+    logger.info(f" Starting batch write restore for {len(available_exports)} tables")
+    restore_results = []
+
+    for table_name in tables_to_restore:
+        if table_name not in available_exports:
+            logger.warning(f"Skipping {table_name} - no valid export found")
+            restore_results.append({
+                'table_name': table_name,
+                'restore_type': 'BATCH_WRITE_FROM_S3',
+                'status': 'SKIPPED',
+                'error': 'No valid export found for this table'
+            })
+            continue
+
+        logger.info(f" Starting restore for {table_name}")
+        result = restore_table_from_s3_export(
+            s3_client,
+            table_name,
+            available_exports[table_name],
+            s3_bucket,
+            clear_existing=config['clear_existing_data'],
+            max_workers=config['max_workers'],
+            verify_count=config['verify_count']
+        )
+        restore_results.append(result)
+
+        # Brief pause between tables
+        if len(available_exports) > 1:
+            time.sleep(2)
+
+    return restore_results
+
+
+def _build_restore_summary(restore_results, start_time, environment, s3_bucket, s3_prefix,
+                            backup_date, tables_to_restore, config):
+    end_time = datetime.now()
+    duration = end_time - start_time
+
+    successful_restores = len([r for r in restore_results if r.get('status') == 'COMPLETED'])
+    partial_restores = len([r for r in restore_results if r.get('status') == 'PARTIAL_SUCCESS'])
+    failed_restores = len([r for r in restore_results if r.get('status') == 'FAILED'])
+    skipped_restores = len([r for r in restore_results if r.get('status') == 'SKIPPED'])
+
+    total_items_written = sum(r.get('items_written', 0) for r in restore_results)
+    total_items_processed = sum(r.get('items_processed', 0) for r in restore_results)
+
+    summary = {
+        'backup_date': backup_date,
+        'environment': environment,
+        's3_bucket': s3_bucket,
+        's3_prefix': s3_prefix,
+        'restore_type': 'BATCH_WRITE_FROM_S3_TO_EXISTING_TABLES',
+        'duration_seconds': int(duration.total_seconds()),
+        'tables_requested': len(tables_to_restore),
+        'successful_restores': successful_restores,
+        'partial_restores': partial_restores,
+        'failed_restores': failed_restores,
+        'skipped_restores': skipped_restores,
+        'total_items_written': total_items_written,
+        'total_items_processed': total_items_processed,
+        'configuration': {
+            'clear_existing_data': config['clear_existing_data'],
+            'max_workers': config['max_workers']
+        },
+        'restore_results': restore_results,
+        'completed_at': end_time.isoformat()
+    }
+
+    logger.info(f"Batch write restore completed in {duration}")
+    logger.info(
+        f"Results: {successful_restores} completed, {partial_restores} partial, "
+        f"{failed_restores} failed, {skipped_restores} skipped"
+    )
+    logger.info(f"Total items: {total_items_written}/{total_items_processed} written")
+
+    if failed_restores > 0 and successful_restores == 0:
+        status_code = 500
+    elif failed_restores > 0 or partial_restores > 0:
+        status_code = 207  # Multi-status
+    else:
+        status_code = 200
+
+    return {
+        'statusCode': status_code,
+        'body': json.dumps(summary, default=decimal_default, indent=2)
+    }
+
+
+def _build_error_response(error, start_time):
+    end_time = datetime.now()
+    duration = end_time - start_time
+
+    logger.exception(f"Critical error in batch write restore after {duration}")
+
+    error_response = {
+        'error': str(error),
+        'restore_type': 'BATCH_WRITE_FROM_S3',
+        'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+        's3_bucket': os.environ.get('BACKUP_BUCKET', 'unknown'),
+        's3_prefix': os.environ.get('S3_EXPORTS_PREFIX', 'native-exports'),
+        'duration_seconds': int(duration.total_seconds()),
+        'failed_at': end_time.isoformat()
+    }
+
+    return {
+        'statusCode': 500,
+        'body': json.dumps(error_response, default=decimal_default, indent=2)
+    }
+
+
 def lambda_handler(event, context):
     """
     Main handler for batch write restoration from Backup exports in S3 or B2
     """
     start_time = datetime.now()
-    
-    restore_mode = event.get('mode', 's3').lower()
-    storage_type = 'B2' if restore_mode == 'b2' else 'S3'
-    
+
+    config = _parse_restore_request(event)
+    storage_type = 'B2' if config['restore_mode'] == 'b2' else 'S3'
+
     logger.info(f" Starting MFA Dynamodb restore from {storage_type} exports at {start_time}")
 
     try:
-        # Validate environment
         env_config = validate_environment()
         environment = env_config['environment']
         s3_prefix = env_config['s3_prefix']  # Will be 'native-exports' by default
 
-        # Parse input parameters
-        backup_date = event.get('backup_date', 'latest')
-        specific_tables = event.get('tables', [])
-        dry_run = event.get('dry_run', False)
-        clear_existing_data = event.get('clear_existing_data', False)
-        max_workers = event.get('max_workers', 5)
-        
-        s3_client = get_storage_client(restore_mode)
-        
-        if restore_mode == 'b2':
-            s3_bucket = os.environ.get('B2_BUCKET_NAME')
-            if not s3_bucket:
-                raise Exception("B2 mode requires B2_BUCKET_NAME environment variable")
-        else:
-            s3_bucket = env_config['backup_bucket']
+        s3_client = get_storage_client(config['restore_mode'])
+        s3_bucket = _resolve_s3_bucket(config['restore_mode'], env_config)
 
-        logger.info(f"  Configuration:")
-        logger.info(f"  Environment: {environment}")
-        logger.info(f"  Storage Mode: {restore_mode.upper()}")
-        logger.info(f"  Bucket: {s3_bucket}")
-        logger.info(f"  Prefix: {s3_prefix}")
-        logger.info(f"  Backup Date: {backup_date}")
-        logger.info(f"  Specific Tables: {specific_tables or 'All available'}")
-        logger.info(f"  Dry Run: {dry_run}")
-        logger.info(f"  Clear Existing Data: {clear_existing_data}")
-        logger.info(f"  Max Workers: {max_workers}")
+        _log_restore_configuration(config, environment, s3_bucket, s3_prefix)
 
-        if clear_existing_data:
-            logger.warning(" WARNING: clear_existing_data=True will DELETE ALL existing data before restore!")
-
-        # Get tables to restore
         all_available_tables = get_tables_to_restore()
-
-        if specific_tables:
-            # Validate requested tables
-            invalid_tables = [t for t in specific_tables if t not in all_available_tables]
-            if invalid_tables:
-                logger.warning(f"Invalid tables requested: {invalid_tables}")
-
-            tables_to_restore = [table for table in specific_tables if table in all_available_tables]
-            if not tables_to_restore:
-                raise Exception(f"None of the specified tables are available. Available: {all_available_tables}")
-        else:
-            tables_to_restore = all_available_tables
-
+        tables_to_restore = _resolve_tables_to_restore(config['specific_tables'], all_available_tables)
         logger.info(f" Tables to restore: {tables_to_restore}")
 
-        # Get backup date if 'latest'
-        if backup_date == 'latest':
-            available_backups = get_available_backups(s3_client, s3_bucket, s3_prefix)
-            if not available_backups:
-                raise Exception(f"No backups found in {s3_bucket}/{s3_prefix}/")
-            backup_date = available_backups[0]
-            logger.info(f" Using latest backup from: {backup_date}")
+        backup_date = _resolve_backup_date(s3_client, s3_bucket, s3_prefix, config['backup_date'])
 
-        # Get and validate backup manifest
         manifest = get_backup_manifest(s3_client, s3_bucket, backup_date, s3_prefix)
         if not manifest:
-            raise Exception(f"Could not find or parse backup manifest for {backup_date}")
+            raise RuntimeError(f"Could not find or parse backup manifest for {backup_date}")
 
-        # Build export lookup
-        available_exports = {}
-        invalid_exports = []
+        available_exports = _build_available_exports(manifest, tables_to_restore, backup_date)
 
-        for export in manifest.get('exports', []):
-            try:
-                validate_export_info(export)
-                table_name = export['table_name']
-                if table_name in tables_to_restore:
-                    available_exports[table_name] = export
-            except ValueError as e:
-                invalid_exports.append(f"{export.get('table_name', 'unknown')}: {str(e)}")
-
-        if invalid_exports:
-            logger.warning(f" Invalid exports found: {invalid_exports}")
-
-        logger.info(f"Available exports for {backup_date}: {list(available_exports.keys())}")
-
-        # Check for missing exports
-        missing_exports = [t for t in tables_to_restore if t not in available_exports]
-        if missing_exports:
-            logger.warning(f" No valid exports found for tables: {missing_exports}")
-
-        if not available_exports:
-            raise Exception("No valid exports found for any requested tables")
-
-        # Dry run mode
-        if dry_run:
-            logger.info(" DRY RUN MODE - Validating restore capability without writing data")
-
-            validation_results = []
-            for table_name in tables_to_restore:
-                if table_name in available_exports:
-                    export_info = available_exports[table_name]
-                    try:
-                        data_files = get_export_data_files(s3_client, s3_bucket, export_info)
-
-                        # Calculate estimated restore size
-                        total_file_size = 0
-                        for file_key in data_files[:5]:  # Sample first 5 files
-                            try:
-                                response = s3_client.head_object(Bucket=s3_bucket, Key=file_key)
-                                total_file_size += response['ContentLength']
-                            except Exception:
-                                pass
-
-                        validation_results.append({
-                            'table_name': table_name,
-                            'status': 'READY',
-                            'export_arn': export_info.get('export_arn', 'unknown'),
-                            'expected_items': export_info.get('item_count', 0),
-                            'data_files_count': len(data_files),
-                            'estimated_size_mb': round(total_file_size / 1024 / 1024, 2),
-                            's3_prefix_used': export_info.get('s3_prefix', 'unknown'),
-                            'restore_options': {
-                                'clear_existing_data': clear_existing_data,
-                                'max_workers': max_workers
-                            }
-                        })
-                    except Exception as e:
-                        validation_results.append({
-                            'table_name': table_name,
-                            'status': 'ERROR',
-                            'error': str(e)
-                        })
-                else:
-                    validation_results.append({
-                        'table_name': table_name,
-                        'status': 'NO_EXPORT',
-                        'error': 'No valid export found for this table'
-                    })
-
-            dry_run_summary = {
-                'dry_run': True,
-                'backup_date': backup_date,
-                'environment': environment,
-                's3_bucket': s3_bucket,
-                's3_prefix': s3_prefix,
-                'restore_type': 'BATCH_WRITE_FROM_S3_TO_EXISTING_TABLES',
-                'tables_requested': len(tables_to_restore),
-                'validation_results': validation_results,
-                'configuration': {
-                    'clear_existing_data': clear_existing_data,
-                    'max_workers': max_workers
-                },
-                'warnings': [
-                    'This approach writes directly to existing tables with the same names',
-                    'Set clear_existing_data=true to clear existing data first',
-                    'Restore will merge with existing data if clear_existing_data=false'
-                ]
-            }
-
-            return {
-                'statusCode': 200,
-                'body': json.dumps(dry_run_summary, default=decimal_default, indent=2)
-            }
-
-        # Perform actual restore
-        logger.info(f" Starting batch write restore for {len(available_exports)} tables")
-        restore_results = []
-
-        for table_name in tables_to_restore:
-            if table_name not in available_exports:
-                logger.warning(f"Skipping {table_name} - no valid export found")
-                restore_results.append({
-                    'table_name': table_name,
-                    'restore_type': 'BATCH_WRITE_FROM_S3',
-                    'status': 'SKIPPED',
-                    'error': 'No valid export found for this table'
-                })
-                continue
-
-            export_info = available_exports[table_name]
-            logger.info(f" Starting restore for {table_name}")
-
-            # Start batch write restore
-            result = restore_table_from_s3_export(
-                s3_client,
-                table_name,
-                export_info,
-                s3_bucket,
-                clear_existing=clear_existing_data,
-                max_workers=max_workers
+        if config['dry_run']:
+            return _run_dry_run(
+                s3_client, s3_bucket, s3_prefix, environment, backup_date,
+                tables_to_restore, available_exports, config
             )
-            restore_results.append(result)
 
-            # Brief pause between tables
-            if len(available_exports) > 1:
-                time.sleep(2)
+        restore_results = _run_table_restores(s3_client, s3_bucket, tables_to_restore, available_exports, config)
 
-        # Generate summary
-        end_time = datetime.now()
-        duration = end_time - start_time
-
-        successful_restores = len([r for r in restore_results if r.get('status') == 'COMPLETED'])
-        partial_restores = len([r for r in restore_results if r.get('status') == 'PARTIAL_SUCCESS'])
-        failed_restores = len([r for r in restore_results if r.get('status') == 'FAILED'])
-        skipped_restores = len([r for r in restore_results if r.get('status') == 'SKIPPED'])
-
-        total_items_written = sum(r.get('items_written', 0) for r in restore_results)
-        total_items_processed = sum(r.get('items_processed', 0) for r in restore_results)
-
-        summary = {
-            'backup_date': backup_date,
-            'environment': environment,
-            's3_bucket': s3_bucket,
-            's3_prefix': s3_prefix,
-            'restore_type': 'BATCH_WRITE_FROM_S3_TO_EXISTING_TABLES',
-            'duration_seconds': int(duration.total_seconds()),
-            'tables_requested': len(tables_to_restore),
-            'successful_restores': successful_restores,
-            'partial_restores': partial_restores,
-            'failed_restores': failed_restores,
-            'skipped_restores': skipped_restores,
-            'total_items_written': total_items_written,
-            'total_items_processed': total_items_processed,
-            'configuration': {
-                'clear_existing_data': clear_existing_data,
-                'max_workers': max_workers
-            },
-            'restore_results': restore_results,
-            'completed_at': end_time.isoformat()
-        }
-
-        # Log summary
-        logger.info(f"Batch write restore completed in {duration}")
-        logger.info(
-            f"Results: {successful_restores} completed, {partial_restores} partial, {failed_restores} failed, {skipped_restores} skipped")
-        logger.info(f"Total items: {total_items_written}/{total_items_processed} written")
-
-        # Determine response status
-        if failed_restores > 0 and successful_restores == 0:
-            status_code = 500
-        elif failed_restores > 0 or partial_restores > 0:
-            status_code = 207  # Multi-status
-        else:
-            status_code = 200
-
-        return {
-            'statusCode': status_code,
-            'body': json.dumps(summary, default=decimal_default, indent=2)
-        }
+        return _build_restore_summary(
+            restore_results, start_time, environment, s3_bucket, s3_prefix,
+            backup_date, tables_to_restore, config
+        )
 
     except Exception as e:
-        end_time = datetime.now()
-        duration = end_time - start_time
-
-        logger.error(f"Critical error in batch write restore after {duration}: {str(e)}")
-
-        error_response = {
-            'error': str(e),
-            'restore_type': 'BATCH_WRITE_FROM_S3',
-            'environment': os.environ.get('ENVIRONMENT', 'unknown'),
-            's3_bucket': os.environ.get('BACKUP_BUCKET', 'unknown'),
-            's3_prefix': os.environ.get('S3_EXPORTS_PREFIX', 'native-exports'),
-            'duration_seconds': int(duration.total_seconds()),
-            'failed_at': end_time.isoformat()
-        }
-
-        return {
-            'statusCode': 500,
-            'body': json.dumps(error_response, default=decimal_default, indent=2)
-        }
+        return _build_error_response(e, start_time)
