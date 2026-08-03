@@ -21,10 +21,21 @@ JSON_GZ_EXTENSION = '.json.gz'
 JSON_EXTENSION = '.json'
 DATA_FILE_EXTENSIONS = (JSON_GZ_EXTENSION, JSON_EXTENSION)
 
+# Restoring is done synchronously in-process (unlike the DynamoDB-managed
+# async export used for backups), so a table/table-set that doesn't finish
+# within one invocation has to be checkpointed and continued in a fresh
+# invocation rather than left to be killed mid-write by the Lambda timeout.
+# RESTORE_TIME_SAFETY_MS is how much runway we reserve to stop cleanly and
+# self-invoke before that happens. MAX_RESTORE_CONTINUATIONS bounds how many
+# times we'll keep re-invoking before giving up and marking the remainder FAILED.
+RESTORE_TIME_SAFETY_MS = 90_000
+MAX_RESTORE_CONTINUATIONS = 10
+
 # Initialize AWS clients outside the handler so they're reused across
 # invocations on a warm Lambda container.
 dynamodb = boto3.client('dynamodb', config=BOTO_CONFIG)
 _default_s3_client = boto3.client('s3', config=BOTO_CONFIG)
+lambda_client = boto3.client('lambda', config=BOTO_CONFIG)
 
 # The B2 client depends on env vars only present in B2 mode, so it can't be
 # built unconditionally at import time - cache it lazily instead so it's only
@@ -62,6 +73,16 @@ def decimal_default(obj):
     if isinstance(obj, Decimal):
         return float(obj)
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _time_running_low(context, safety_ms=RESTORE_TIME_SAFETY_MS):
+    """True once the invocation has less than safety_ms of execution time left"""
+    if context is None:
+        return False
+    try:
+        return context.get_remaining_time_in_millis() < safety_ms
+    except Exception:
+        return False
 
 
 def validate_environment():
@@ -441,37 +462,52 @@ def _delete_item_page(table_name, items, partition_key, sort_key):
     return items_deleted
 
 
-def clear_existing_table_data(table_name):
+def clear_existing_table_data(table_name, context=None, start_key=None):
     """
     Clear existing table data before restore
     WARNING: This deletes all existing data!
+
+    Returns (success, items_deleted, last_evaluated_key, interrupted). When
+    interrupted is True, last_evaluated_key can be passed back in as start_key
+    to resume the scan where it left off - deletes are idempotent, so resuming
+    (or even restarting from scratch) never risks double-deleting anything.
     """
+    items_deleted = 0
     try:
         logger.warning(f" CLEARING ALL DATA from table: {table_name}")
 
         partition_key, sort_key = _get_table_key_schema(table_name)
         logger.info(f"Table schema - Partition key: {partition_key}, Sort key: {sort_key}")
 
-        items_deleted = 0
         batch_count = 0
 
-        paginator = dynamodb.get_paginator('scan')
-        for page in paginator.paginate(TableName=table_name):
-            items = page.get('Items', [])
-            if not items:
-                continue
+        paginate_kwargs = {'TableName': table_name}
+        if start_key:
+            paginate_kwargs['ExclusiveStartKey'] = start_key
 
-            items_deleted += _delete_item_page(table_name, items, partition_key, sort_key)
-            batch_count += 1
-            if batch_count % 10 == 0:
-                logger.info(f"Deletion progress: ~{items_deleted} items deleted...")
+        paginator = dynamodb.get_paginator('scan')
+        for page in paginator.paginate(**paginate_kwargs):
+            items = page.get('Items', [])
+            if items:
+                items_deleted += _delete_item_page(table_name, items, partition_key, sort_key)
+                batch_count += 1
+                if batch_count % 10 == 0:
+                    logger.info(f"Deletion progress: ~{items_deleted} items deleted...")
+
+            last_evaluated_key = page.get('LastEvaluatedKey')
+            if last_evaluated_key and _time_running_low(context):
+                logger.warning(
+                    f"Pausing delete for {table_name} with {items_deleted} items deleted so far "
+                    f"to avoid hitting the Lambda timeout mid-scan"
+                )
+                return True, items_deleted, last_evaluated_key, True
 
         logger.info(f" Successfully cleared {items_deleted} items from {table_name}")
-        return True, items_deleted
+        return True, items_deleted, None, False
 
     except Exception:
         logger.exception(" Failed to clear table data")
-        return False, 0
+        return False, items_deleted, None, False
 
 
 def _attempt_batch_write(table_name, put_requests, batch_size, attempt, max_retries):
@@ -576,38 +612,49 @@ def count_table_items(table_name):
     return total
 
 
-def _process_export_data_files(s3_client, s3_bucket, table_name, data_files, max_workers):
-    """Parse and write each export data file, returning aggregate counts"""
+def _process_export_data_files(s3_client, s3_bucket, table_name, data_files, max_workers,
+                                context=None, start_index=0):
+    """
+    Parse and write each export data file from start_index onward, returning aggregate
+    counts plus (next_index, interrupted) so an interrupted run can resume at the next
+    unprocessed file instead of re-writing files already written (writes are upserts,
+    so redoing a file is harmless, but resuming avoids the wasted work).
+    """
     total_items_processed = 0
     total_items_written = 0
     total_items_failed = 0
     failed_files = []
 
-    for i, data_file in enumerate(data_files):
+    for i in range(start_index, len(data_files)):
+        data_file = data_files[i]
         logger.info(f" Processing file {i + 1}/{len(data_files)}: {data_file}")
 
         items, file_failed = parse_dynamodb_json_file(s3_client, s3_bucket, data_file)
         if file_failed:
             logger.error(f"File failed to parse and was skipped entirely: {data_file}")
             failed_files.append(data_file)
-            continue
-        if not items:
+        elif not items:
             logger.warning(f"No items found in {data_file}")
-            continue
+        else:
+            logger.info(f"Found {len(items)} items in {data_file}")
 
-        logger.info(f"Found {len(items)} items in {data_file}")
+            written, failed = batch_write_items_to_table(table_name, items, max_workers)
 
-        written, failed = batch_write_items_to_table(table_name, items, max_workers)
+            total_items_processed += len(items)
+            total_items_written += written
+            total_items_failed += failed
 
-        total_items_processed += len(items)
-        total_items_written += written
-        total_items_failed += failed
+        is_last_file = i == len(data_files) - 1
+        if not is_last_file and _time_running_low(context):
+            logger.warning(f"Pausing write for {table_name} after file {i + 1}/{len(data_files)} "
+                            f"to avoid hitting the Lambda timeout mid-restore")
+            return total_items_processed, total_items_written, total_items_failed, failed_files, i + 1, True
 
         # Brief pause between files to avoid overwhelming DynamoDB
-        if i < len(data_files) - 1:
+        if not is_last_file:
             time.sleep(1)
 
-    return total_items_processed, total_items_written, total_items_failed, failed_files
+    return total_items_processed, total_items_written, total_items_failed, failed_files, len(data_files), False
 
 
 def _determine_restore_status(failed_files, total_items_failed, total_items_written, expected_items):
@@ -655,28 +702,73 @@ def _verify_restored_count(result, table_name, expected_items, cleared):
         result['count_verification_error'] = str(e)
 
 
+def _build_interrupted_result(table_name, phase, **resume_fields):
+    """Marks a table's restore as paused partway through so the orchestrator can
+    self-invoke a continuation instead of treating it as a normal outcome."""
+    return {
+        'table_name': table_name,
+        'restore_type': 'BATCH_WRITE_FROM_S3',
+        'status': 'INTERRUPTED',
+        'resume_state': {'phase': phase, **resume_fields}
+    }
+
+
 def restore_table_from_s3_export(s3_client, table_name, export_info, s3_bucket, clear_existing=False,
-                                  max_workers=5, verify_count=False):
+                                  max_workers=5, verify_count=False, context=None, resume_state=None):
     """
-    Restore table data from S3 export using batch write operations
+    Restore table data from S3 export using batch write operations.
+
+    context/resume_state let this pick up mid-restore: if get_remaining_time_in_millis()
+    runs low, this returns an INTERRUPTED result with enough state (scan cursor or next
+    file index) for the caller to re-invoke and continue rather than being killed
+    mid-write by the Lambda timeout.
     """
     logger.info(f" Starting batch write restore for table: {table_name}")
+    resume_state = resume_state or {}
 
     try:
-        items_cleared = 0
-        if clear_existing:
+        phase = resume_state.get('phase', 'CLEARING' if clear_existing else 'WRITING')
+        items_cleared = resume_state.get('items_cleared', 0)
+
+        if clear_existing and phase == 'CLEARING':
             logger.warning(" Clearing existing data as requested")
-            success, items_cleared = clear_existing_table_data(table_name)
+            success, deleted, last_evaluated_key, interrupted = clear_existing_table_data(
+                table_name, context=context, start_key=resume_state.get('last_evaluated_key')
+            )
+            items_cleared += deleted
             if not success:
                 raise RuntimeError("Failed to clear existing table data")
+            if interrupted:
+                return _build_interrupted_result(
+                    table_name, 'CLEARING', items_cleared=items_cleared, last_evaluated_key=last_evaluated_key
+                )
+            phase = 'WRITING'
 
         data_files = get_export_data_files(s3_client, s3_bucket, export_info)
         if not data_files:
             raise RuntimeError("No data files found for export")
 
-        total_items_processed, total_items_written, total_items_failed, failed_files = (
-            _process_export_data_files(s3_client, s3_bucket, table_name, data_files, max_workers)
+        start_index = resume_state.get('file_index', 0) if phase == 'WRITING' else 0
+        prior_processed = resume_state.get('items_processed', 0)
+        prior_written = resume_state.get('items_written', 0)
+        prior_failed = resume_state.get('items_failed', 0)
+        prior_failed_files = resume_state.get('failed_files', [])
+
+        processed, written, failed, new_failed_files, next_index, interrupted = _process_export_data_files(
+            s3_client, s3_bucket, table_name, data_files, max_workers, context=context, start_index=start_index
         )
+
+        total_items_processed = prior_processed + processed
+        total_items_written = prior_written + written
+        total_items_failed = prior_failed + failed
+        failed_files = prior_failed_files + new_failed_files
+
+        if interrupted:
+            return _build_interrupted_result(
+                table_name, 'WRITING', items_cleared=items_cleared, file_index=next_index,
+                items_processed=total_items_processed, items_written=total_items_written,
+                items_failed=total_items_failed, failed_files=failed_files
+            )
 
         expected_items = export_info.get('item_count', 0)
 
@@ -889,11 +981,21 @@ def _run_dry_run(s3_client, s3_bucket, s3_prefix, environment, backup_date, tabl
     }
 
 
-def _run_table_restores(s3_client, s3_bucket, tables_to_restore, available_exports, config):
+def _run_table_restores(s3_client, s3_bucket, tables_to_restore, available_exports, config,
+                         context=None, restore_results=None, resume_table_state=None):
+    """
+    Restore each table in order. Returns (restore_results, remaining_tables, resume_table_state).
+    remaining_tables is empty when every table finished; otherwise the first entry is the
+    table that was in progress (paired with resume_table_state) and the rest haven't started.
+    """
     logger.info(f" Starting batch write restore for {len(available_exports)} tables")
-    restore_results = []
+    restore_results = list(restore_results) if restore_results else []
 
-    for table_name in tables_to_restore:
+    for i, table_name in enumerate(tables_to_restore):
+        if _time_running_low(context):
+            logger.warning(f"Pausing restore before starting {table_name} to avoid the Lambda timeout")
+            return restore_results, tables_to_restore[i:], None
+
         if table_name not in available_exports:
             logger.warning(f"Skipping {table_name} - no valid export found")
             restore_results.append({
@@ -912,15 +1014,22 @@ def _run_table_restores(s3_client, s3_bucket, tables_to_restore, available_expor
             s3_bucket,
             clear_existing=config['clear_existing_data'],
             max_workers=config['max_workers'],
-            verify_count=config['verify_count']
+            verify_count=config['verify_count'],
+            context=context,
+            resume_state=resume_table_state if i == 0 else None
         )
+        resume_table_state = None  # only ever applies to the (possibly resumed) first table
+
+        if result.get('status') == 'INTERRUPTED':
+            return restore_results, tables_to_restore[i:], result['resume_state']
+
         restore_results.append(result)
 
         # Brief pause between tables
         if len(available_exports) > 1:
             time.sleep(2)
 
-    return restore_results
+    return restore_results, [], None
 
 
 def _build_restore_summary(restore_results, start_time, environment, s3_bucket, s3_prefix,
@@ -1000,10 +1109,139 @@ def _build_error_response(error, start_time):
     }
 
 
+def _trigger_restore_continuation(function_name, backup_date, config, remaining_tables, resume_table_state,
+                                   restore_results, tables_requested, start_time, continuation_count):
+    """Asynchronously re-invoke this Lambda to keep restoring where this invocation left off"""
+    payload = {
+        'continue_restore': True,
+        'backup_date': backup_date,
+        'restore_mode': config['restore_mode'],
+        'clear_existing_data': config['clear_existing_data'],
+        'max_workers': config['max_workers'],
+        'verify_count': config['verify_count'],
+        'remaining_tables': remaining_tables,
+        'resume_table_state': resume_table_state,
+        'restore_results': restore_results,
+        'tables_requested': tables_requested,
+        'start_time': start_time.isoformat(),
+        'continuation_count': continuation_count,
+    }
+
+    try:
+        lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType='Event',
+            Payload=json.dumps(payload, default=decimal_default).encode('utf-8')
+        )
+        logger.warning(f"Restore continuation {continuation_count} triggered for {len(remaining_tables)} "
+                        f"remaining table(s): {remaining_tables}")
+    except Exception:
+        logger.exception("Failed to trigger restore continuation")
+
+
+def _handle_restore_interruption(function_name, restore_results, remaining_tables, resume_table_state,
+                                  start_time, environment, s3_bucket, s3_prefix, backup_date,
+                                  tables_requested, config, continuation_count):
+    """
+    Called when _run_table_restores stopped early because the Lambda was running out of
+    time. Either self-invokes a continuation, or - if MAX_RESTORE_CONTINUATIONS has been
+    hit - gives up and marks whatever's left FAILED so it's visible rather than silently
+    incomplete.
+    """
+    if continuation_count > MAX_RESTORE_CONTINUATIONS:
+        logger.error(f"Restore for {backup_date} did not finish after {continuation_count - 1} continuations; "
+                     f"giving up on: {remaining_tables}")
+        for table_name in remaining_tables:
+            restore_results.append({
+                'table_name': table_name,
+                'restore_type': 'BATCH_WRITE_FROM_S3',
+                'status': 'FAILED',
+                'error': f"Restore did not complete after {continuation_count - 1} continuation attempts"
+            })
+        return _build_restore_summary(
+            restore_results, start_time, environment, s3_bucket, s3_prefix,
+            backup_date, tables_requested, config
+        )
+
+    _trigger_restore_continuation(
+        function_name, backup_date, config, remaining_tables, resume_table_state,
+        restore_results, tables_requested, start_time, continuation_count
+    )
+
+    return {
+        'statusCode': 202,
+        'body': json.dumps({
+            'status': 'IN_PROGRESS',
+            'backup_date': backup_date,
+            'completed_tables': [r['table_name'] for r in restore_results],
+            'remaining_tables': remaining_tables,
+            'continuation_count': continuation_count,
+            'message': 'Restore paused before the Lambda time limit; continuing asynchronously.'
+        }, default=decimal_default)
+    }
+
+
+def _continue_restore(event, context):
+    """Resume a restore that a previous invocation paused via _handle_restore_interruption"""
+    backup_date = event['backup_date']
+    config = {
+        'restore_mode': event['restore_mode'],
+        'clear_existing_data': event['clear_existing_data'],
+        'max_workers': event['max_workers'],
+        'verify_count': event['verify_count'],
+    }
+    remaining_tables = event['remaining_tables']
+    resume_table_state = event.get('resume_table_state')
+    restore_results = event.get('restore_results', [])
+    tables_requested = event.get('tables_requested', remaining_tables)
+    start_time = datetime.fromisoformat(event['start_time'])
+    continuation_count = event.get('continuation_count', 1)
+
+    logger.info(f"Resuming restore for backup_date={backup_date}, continuation {continuation_count}, "
+                f"{len(remaining_tables)} table(s) remaining")
+
+    try:
+        env_config = validate_environment()
+        environment = env_config['environment']
+        s3_prefix = env_config['s3_prefix']
+
+        s3_client = get_storage_client(config['restore_mode'])
+        s3_bucket = _resolve_s3_bucket(config['restore_mode'], env_config)
+
+        manifest = get_backup_manifest(s3_client, s3_bucket, backup_date, s3_prefix)
+        if not manifest:
+            raise RuntimeError(f"Could not find or parse backup manifest for {backup_date}")
+
+        available_exports = _build_available_exports(manifest, remaining_tables, backup_date)
+
+        new_results, still_remaining, next_resume_state = _run_table_restores(
+            s3_client, s3_bucket, remaining_tables, available_exports, config, context=context,
+            restore_results=restore_results, resume_table_state=resume_table_state
+        )
+
+        if still_remaining:
+            return _handle_restore_interruption(
+                context.function_name, new_results, still_remaining, next_resume_state,
+                start_time, environment, s3_bucket, s3_prefix, backup_date,
+                tables_requested, config, continuation_count + 1
+            )
+
+        return _build_restore_summary(
+            new_results, start_time, environment, s3_bucket, s3_prefix,
+            backup_date, tables_requested, config
+        )
+
+    except Exception as e:
+        return _build_error_response(e, start_time)
+
+
 def lambda_handler(event, context):
     """
     Main handler for batch write restoration from Backup exports in S3 or B2
     """
+    if event.get('continue_restore'):
+        return _continue_restore(event, context)
+
     start_time = datetime.now()
 
     config = _parse_restore_request(event)
@@ -1039,7 +1277,16 @@ def lambda_handler(event, context):
                 tables_to_restore, available_exports, config
             )
 
-        restore_results = _run_table_restores(s3_client, s3_bucket, tables_to_restore, available_exports, config)
+        restore_results, remaining_tables, resume_table_state = _run_table_restores(
+            s3_client, s3_bucket, tables_to_restore, available_exports, config, context=context
+        )
+
+        if remaining_tables:
+            return _handle_restore_interruption(
+                context.function_name, restore_results, remaining_tables, resume_table_state,
+                start_time, environment, s3_bucket, s3_prefix, backup_date,
+                tables_to_restore, config, continuation_count=1
+            )
 
         return _build_restore_summary(
             restore_results, start_time, environment, s3_bucket, s3_prefix,

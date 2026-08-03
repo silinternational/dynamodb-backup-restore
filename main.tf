@@ -398,6 +398,19 @@ resource "aws_iam_role_policy" "disaster_recovery_lambda_policy" {
           }
         }
       },
+
+      {
+        # Lets the function re-invoke itself asynchronously to continue a restore
+        # that's still running when the Lambda is about to hit its timeout, rather
+        # than being killed mid-write. Built from the deterministic function name
+        # (rather than the resource's .arn) to avoid a dependency cycle with
+        # aws_lambda_function.disaster_recovery, which depends_on this policy.
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = "arn:aws:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.app_name}-disaster-recovery-${local.short_env_name}"
+      },
     ]
   })
 }
