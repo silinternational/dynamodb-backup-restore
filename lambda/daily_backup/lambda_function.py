@@ -682,7 +682,7 @@ def lambda_handler(event: dict[str, Any], context: LambdaContext) -> dict[str, U
         # Phase 3: Create export manifest
         manifest_key = create_export_manifest(export_results, backup_date, s3_bucket, environment)
         if manifest_key is None:
-            raise RuntimeError("Export manifest creation failed")
+            logger.error("Export manifest creation failed; continuing to Backblaze copy")
 
         # Generate summary
         successful_exports, failed_exports, total_items, total_size_mb = _calculate_export_summary(export_results)

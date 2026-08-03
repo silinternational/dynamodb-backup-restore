@@ -394,12 +394,21 @@ def _delete_request_for_item(item, partition_key, sort_key):
 
 
 def _delete_batch_with_retries(table_name, delete_requests, max_retries=3):
-    """Delete one batch of up to 25 keys, retrying unprocessed requests with backoff"""
+    """Delete one batch of up to 25 keys, retrying unprocessed requests and exceptions with backoff"""
     pending = delete_requests
     batch_size = len(pending)
 
     for attempt in range(max_retries):
-        response = dynamodb.batch_write_item(RequestItems={table_name: pending})
+        try:
+            response = dynamodb.batch_write_item(RequestItems={table_name: pending})
+        except Exception:
+            if attempt >= max_retries - 1:
+                logger.exception(f"Batch delete failed after {max_retries} attempts")
+                return batch_size - len(pending)
+            logger.warning(f"Batch delete attempt {attempt + 1} failed, retrying...", exc_info=True)
+            time.sleep(min(2 ** attempt, 10))
+            continue
+
         pending = response.get('UnprocessedItems', {}).get(table_name, [])
         if not pending:
             return batch_size
