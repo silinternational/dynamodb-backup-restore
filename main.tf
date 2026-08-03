@@ -210,6 +210,19 @@ resource "aws_iam_role_policy" "daily_backup_lambda_policy" {
           "sts:GetCallerIdentity"
         ]
         Resource = "*"
+      },
+      {
+        # Lets the function re-invoke itself asynchronously to reconcile the
+        # manifest once an export that was still running when we stopped
+        # watching it reaches a terminal state. Built from the deterministic
+        # function name (rather than the resource's .arn) to avoid a
+        # dependency cycle with aws_lambda_function.daily_backup, which
+        # depends_on this policy.
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = "arn:aws:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.app_name}-daily-backup-${local.short_env_name}"
       }
     ]
   })

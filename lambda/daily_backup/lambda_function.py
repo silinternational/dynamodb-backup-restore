@@ -14,6 +14,14 @@ import logging
 CONTENT_TYPE_JSON = 'application/json'
 EXPORT_PREFIX_ROOT = 'native-exports'
 
+# An export that's still running when wait_for_exports_completion gives up is
+# resolved by re-invoking this same Lambda asynchronously to check again,
+# rather than leaving the manifest permanently stale. Capped at
+# MAX_RECONCILE_ATTEMPTS so a genuinely stuck export doesn't self-invoke
+# forever - after that it's recorded as FAILED so it's visible/alertable.
+RECONCILE_WAIT_TIME = 840
+MAX_RECONCILE_ATTEMPTS = 6
+
 # Set up logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -27,6 +35,7 @@ BOTO_CONFIG = Config(connect_timeout=10, read_timeout=30)
 dynamodb = boto3.client('dynamodb', config=BOTO_CONFIG)
 s3 = boto3.client('s3', config=BOTO_CONFIG)
 sts = boto3.client('sts', config=BOTO_CONFIG)
+lambda_client = boto3.client('lambda', config=BOTO_CONFIG)
 
 # The Backblaze client depends on env vars only present when a copy is
 # requested, so it can't be built unconditionally at import time - cache it
@@ -184,9 +193,11 @@ def _handle_timed_out_exports(export_arns: list[str]) -> list[dict[str, Any]]:
     timed_out_exports = []
     for export_arn in export_arns:
         status_info = check_export_status(export_arn)
+        status_info['last_known_status'] = status_info['status']
+        status_info['status'] = 'PENDING'
         status_info['timeout'] = True
         timed_out_exports.append(status_info)
-        logger.warning(f"Export monitoring timed out: {export_arn}")
+        logger.warning(f"Export monitoring timed out, marking PENDING for reconciliation: {export_arn}")
     return timed_out_exports
 
 
@@ -231,6 +242,7 @@ def create_export_manifest(
     total_exports = len(completed_exports)
     successful_exports = len([e for e in completed_exports if e['status'] == 'COMPLETED'])
     failed_exports = len([e for e in completed_exports if e['status'] in ['FAILED', 'UNKNOWN']])
+    pending_exports = len([e for e in completed_exports if e['status'] == 'PENDING'])
     total_items = sum(e.get('item_count', 0) for e in completed_exports if e.get('item_count'))
     total_size_bytes = sum(e.get('billing_size_bytes', 0) for e in completed_exports if e.get('billing_size_bytes'))
 
@@ -242,6 +254,7 @@ def create_export_manifest(
         'total_exports': total_exports,
         'successful_exports': successful_exports,
         'failed_exports': failed_exports,
+        'pending_exports': pending_exports,
         'total_items_exported': total_items,
         'total_size_bytes': total_size_bytes,
         's3_bucket': s3_bucket,
@@ -272,6 +285,123 @@ def create_export_manifest(
     except Exception:
         logger.exception("Failed to create export manifest")
         return None
+
+
+def _trigger_manifest_reconciliation(
+        function_name: str,
+        backup_date: str,
+        s3_bucket: str,
+        environment: str,
+        pending_exports: list[dict[str, Any]],
+        attempt: int = 1
+) -> None:
+    """
+    Asynchronously re-invoke this Lambda to check back on exports that were
+    still running when wait_for_exports_completion gave up, so the manifest
+    gets patched with their real outcome instead of staying stuck on PENDING.
+    """
+    payload = {
+        'reconcile_manifest': True,
+        'backup_date': backup_date,
+        's3_bucket': s3_bucket,
+        'environment': environment,
+        'pending_export_arns': [e['export_arn'] for e in pending_exports],
+        'attempt': attempt,
+    }
+
+    try:
+        lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType='Event',
+            Payload=json.dumps(payload).encode('utf-8')
+        )
+        logger.info(
+            f"Triggered manifest reconciliation attempt {attempt} for {len(pending_exports)} pending export(s)")
+    except Exception:
+        logger.exception("Failed to trigger manifest reconciliation")
+
+
+def _patch_manifest_with_resolved_exports(
+        s3_bucket: str,
+        backup_date: str,
+        resolved_exports: list[dict[str, Any]]
+) -> None:
+    """Patch an existing manifest in place with the now-resolved status of previously-pending exports"""
+    manifest_key = f"{EXPORT_PREFIX_ROOT}/{backup_date}/manifest.json"
+    account_id = get_account_id()
+
+    try:
+        response = s3.get_object(Bucket=s3_bucket, Key=manifest_key, ExpectedBucketOwner=account_id)
+        manifest = json.loads(response['Body'].read())
+    except Exception:
+        logger.exception(f"Failed to load manifest for reconciliation: {manifest_key}")
+        return
+
+    resolved_by_arn = {e['export_arn']: e for e in resolved_exports}
+    for export in manifest.get('exports', []):
+        resolved = resolved_by_arn.get(export.get('export_arn'))
+        if resolved:
+            export.update(resolved)
+
+    exports = manifest.get('exports', [])
+    manifest['successful_exports'] = len([e for e in exports if e.get('status') == 'COMPLETED'])
+    manifest['failed_exports'] = len([e for e in exports if e.get('status') in ['FAILED', 'UNKNOWN']])
+    manifest['pending_exports'] = len([e for e in exports if e.get('status') == 'PENDING'])
+    manifest['total_items_exported'] = sum(e.get('item_count', 0) for e in exports if e.get('item_count'))
+    manifest['total_size_bytes'] = sum(e.get('billing_size_bytes', 0) for e in exports if e.get('billing_size_bytes'))
+    manifest['reconciled_at'] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        s3.put_object(
+            Bucket=s3_bucket,
+            Key=manifest_key,
+            Body=json.dumps(manifest, default=decimal_default, indent=2),
+            ContentType=CONTENT_TYPE_JSON,
+            ExpectedBucketOwner=account_id
+        )
+        logger.info(f"Manifest reconciled: s3://{s3_bucket}/{manifest_key}")
+    except Exception:
+        logger.exception(f"Failed to write reconciled manifest: {manifest_key}")
+
+
+def _reconcile_pending_exports(event: dict[str, Any], function_name: str) -> dict[str, Union[int, str]]:
+    """Re-check exports that were PENDING at manifest-creation time, patch the manifest, and
+    self-invoke again if any are still not in a terminal state (up to MAX_RECONCILE_ATTEMPTS)."""
+    backup_date = event['backup_date']
+    s3_bucket = event['s3_bucket']
+    pending_export_arns = event['pending_export_arns']
+    attempt = event.get('attempt', 1)
+
+    logger.info(f"Reconciliation attempt {attempt}: checking {len(pending_export_arns)} pending export(s) "
+                f"for backup_date={backup_date}")
+
+    resolved_exports = wait_for_exports_completion(pending_export_arns, max_wait_time=RECONCILE_WAIT_TIME)
+
+    still_pending = [e for e in resolved_exports if e.get('status') == 'PENDING']
+    if still_pending and attempt >= MAX_RECONCILE_ATTEMPTS:
+        for export in still_pending:
+            export['status'] = 'FAILED'
+            export['failure_message'] = export.get('failure_message') or (
+                f"Export did not complete after {attempt} reconciliation attempts"
+            )
+        logger.error(f"{len(still_pending)} export(s) still not complete after {attempt} attempts, "
+                     f"marking FAILED: {[e['export_arn'] for e in still_pending]}")
+        still_pending = []
+
+    _patch_manifest_with_resolved_exports(s3_bucket, backup_date, resolved_exports)
+
+    if still_pending:
+        _trigger_manifest_reconciliation(
+            function_name, backup_date, s3_bucket, event['environment'], still_pending, attempt=attempt + 1
+        )
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'reconciled': len(resolved_exports) - len(still_pending),
+            'still_pending': len(still_pending)
+        })
+    }
 
 
 def _derive_b2_region_from_endpoint(endpoint: str) -> str:
@@ -533,15 +663,16 @@ def _update_export_results_with_completion(export_results: list[dict[str, Any]],
                     break
 
 
-def _calculate_export_summary(export_results: list[dict[str, Any]]) -> tuple[int, int, int, float]:
+def _calculate_export_summary(export_results: list[dict[str, Any]]) -> tuple[int, int, int, int, float]:
     """Calculate summary statistics for exports"""
     successful_exports = len([r for r in export_results if r.get('status') == 'COMPLETED'])
     failed_exports = len([r for r in export_results if r.get('status') in ['FAILED', 'UNKNOWN']])
+    pending_exports = len([r for r in export_results if r.get('status') == 'PENDING'])
     total_items = sum(r.get('item_count', 0) for r in export_results if r.get('item_count'))
     total_size_mb = sum(r.get('billing_size_bytes', 0) for r in export_results if r.get('billing_size_bytes')) / (
                 1024 * 1024)
 
-    return successful_exports, failed_exports, total_items, total_size_mb
+    return successful_exports, failed_exports, pending_exports, total_items, total_size_mb
 
 
 def _handle_backblaze_copy(successful_exports: int, s3_bucket: str, backup_date: str, environment: str) -> dict[
@@ -575,11 +706,13 @@ def _handle_backblaze_copy(successful_exports: int, s3_bucket: str, backup_date:
         }
 
 
-def _determine_status_code(failed_exports: int, successful_exports: int, backblaze_copy_results: dict[str, Any]) -> int:
+def _determine_status_code(failed_exports: int, successful_exports: int, pending_exports: int,
+                            backblaze_copy_results: dict[str, Any]) -> int:
     """Determine the appropriate HTTP status code"""
     if failed_exports > 0 and successful_exports == 0:
         return 500
-    elif failed_exports > 0 or (backblaze_copy_results and backblaze_copy_results['status'] == 'FAILED'):
+    elif (failed_exports > 0 or pending_exports > 0
+          or (backblaze_copy_results and backblaze_copy_results['status'] == 'FAILED')):
         return 207
     else:
         return 200
@@ -601,6 +734,7 @@ def _create_backup_summary(
         export_results: list[dict[str, Any]],
         successful_exports: int,
         failed_exports: int,
+        pending_exports: int,
         total_items: int,
         total_size_mb: float,
         manifest_key: Optional[str],
@@ -615,6 +749,7 @@ def _create_backup_summary(
         'total_tables_processed': len(export_results),
         'successful_exports': successful_exports,
         'failed_exports': failed_exports,
+        'pending_exports': pending_exports,
         'total_items_exported': total_items,
         'total_size_mb': round(total_size_mb, 2),
         'manifest_s3_key': manifest_key,
@@ -624,10 +759,11 @@ def _create_backup_summary(
     }
 
 
-def _log_backup_completion(successful_exports: int, failed_exports: int,
+def _log_backup_completion(successful_exports: int, failed_exports: int, pending_exports: int,
                            backblaze_copy_results: dict[str, Any]) -> None:
     """Log backup completion information"""
-    logger.info(f"Backup completed: {successful_exports} successful, {failed_exports} failed")
+    logger.info(f"Backup completed: {successful_exports} successful, {failed_exports} failed, "
+                f"{pending_exports} pending reconciliation")
     if backblaze_copy_results:
         logger.info(
             f"Backblaze copy: {backblaze_copy_results['files_copied']} files copied, status: {backblaze_copy_results['status']}")
@@ -660,6 +796,9 @@ class LambdaContext(Protocol):
 
 def lambda_handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Union[int, str]]:
     """Main Lambda handler for DynamoDB native exports with Backblaze copy"""
+    if event.get('reconcile_manifest'):
+        return _reconcile_pending_exports(event, context.function_name)
+
     logger.info("Starting MFA daily backup using DynamoDB native export")
 
     try:
@@ -684,21 +823,31 @@ def lambda_handler(event: dict[str, Any], context: LambdaContext) -> dict[str, U
         if manifest_key is None:
             logger.error("Export manifest creation failed; continuing to Backblaze copy")
 
+        # Phase 3b: any exports still running when we stopped watching get reconciled
+        # asynchronously so the manifest doesn't stay stuck on a stale PENDING status
+        pending_export_results = [r for r in export_results if r.get('status') == 'PENDING']
+        if pending_export_results and manifest_key:
+            _trigger_manifest_reconciliation(
+                context.function_name, backup_date, s3_bucket, environment, pending_export_results, attempt=1
+            )
+
         # Generate summary
-        successful_exports, failed_exports, total_items, total_size_mb = _calculate_export_summary(export_results)
+        successful_exports, failed_exports, pending_exports, total_items, total_size_mb = \
+            _calculate_export_summary(export_results)
 
         # Phase 4: Copy to Backblaze
         backblaze_copy_results = _handle_backblaze_copy(successful_exports, s3_bucket, backup_date, environment)
 
         # Create summary and log completion
         summary = _create_backup_summary(
-            backup_date, environment, export_results, successful_exports, failed_exports,
+            backup_date, environment, export_results, successful_exports, failed_exports, pending_exports,
             total_items, total_size_mb, manifest_key, s3_bucket, backblaze_copy_results
         )
 
-        _log_backup_completion(successful_exports, failed_exports, backblaze_copy_results)
+        _log_backup_completion(successful_exports, failed_exports, pending_exports, backblaze_copy_results)
 
-        status_code = _determine_status_code(failed_exports, successful_exports, backblaze_copy_results)
+        status_code = _determine_status_code(failed_exports, successful_exports, pending_exports,
+                                              backblaze_copy_results)
 
         return {
             'statusCode': status_code,
